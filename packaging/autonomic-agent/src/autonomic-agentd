@@ -1,0 +1,165 @@
+#!/usr/bin/python3
+"""autonomic-agentd -- the agent's resident body in the system.
+
+M1 scope (see docs/M1.md): hold the identity and nothing else.
+
+  1. keeps the Action counter (``action_seq``) in a private state file;
+  2. publishes a READ-ONLY projection of the world version at
+     ``/run/autonomic/world``;
+  3. watches that projection for drift -- if it does not match what the
+     agent last wrote, something changed the world without going through
+     the Action channel, and that is worth a warning line.
+
+That third point is the whole reason the marker is read-only: the counter
+lives outside the system, the system only ever gets a projection of it.
+A projection that disagrees with the source of truth is evidence.
+
+Signals
+  SIGUSR1  record one Action -- action_seq += 1
+  SIGTERM  shut down cleanly
+
+Everything else (user, cgroup quota, journal namespace, hardening) is
+declared in the systemd unit, not here. This process does not try to be
+clever; being a well-behaved system citizen is the product.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import signal
+import sys
+import time
+
+VERSION = "0.1.0"
+
+STATE_DIR = "/var/lib/autonomic"
+STATE_FILE = os.path.join(STATE_DIR, "state.json")
+RUNTIME_DIR = "/run/autonomic"
+WORLD_MARKER = os.path.join(RUNTIME_DIR, "world")
+PID_FILE = os.path.join(RUNTIME_DIR, "agent.pid")
+
+TICK_SECONDS = 5
+
+# ---------------------------------------------------------------- logging
+# stdout/stderr go straight to the journal under SyslogIdentifier=
+# (and, thanks to LogNamespace=, to their own namespace).
+
+
+def log(level: str, msg: str) -> None:
+    sys.stderr.write("[%s] %s\n" % (level, msg))
+    sys.stderr.flush()
+
+
+# ---------------------------------------------------------------- state
+
+
+def load_state() -> dict:
+    try:
+        with open(STATE_FILE, "r") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        data = {}
+    data.setdefault("snapshot_id", "bootstrap")
+    data.setdefault("action_seq", 0)
+    return data
+
+
+def save_state(state: dict) -> None:
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(state, fh, sort_keys=True)
+        fh.write("\n")
+    os.replace(tmp, STATE_FILE)
+
+
+def render_world(state: dict) -> str:
+    """The world version, as the system is allowed to see it.
+
+    (snapshot_id, action_seq) -- a monotonic counter owned outside the
+    system, projected into it read-only.
+    """
+    return "snapshot_id=%s\naction_seq=%d\n" % (
+        state["snapshot_id"],
+        state["action_seq"],
+    )
+
+
+def publish_world(state: dict) -> None:
+    """Write the marker atomically and leave it read-only.
+
+    0444 is deliberate: not even this process should be able to edit the
+    marker in place. Any change goes through a fresh atomic replace, so a
+    stray write by anyone else shows up as drift immediately.
+    """
+    expected = render_world(state)
+    os.makedirs(RUNTIME_DIR, exist_ok=True)
+    tmp = WORLD_MARKER + ".tmp"
+    with open(tmp, "w") as fh:
+        fh.write(expected)
+    os.chmod(tmp, 0o444)
+    os.replace(tmp, WORLD_MARKER)
+    return expected
+
+
+def check_drift(state: dict) -> None:
+    expected = render_world(state)
+    try:
+        with open(WORLD_MARKER, "r") as fh:
+            actual = fh.read()
+    except OSError:
+        return
+    if actual != expected:
+        log(
+            "WARN",
+            "world marker drift: expected %r, found %r -- "
+            "the world changed without going through the Action channel"
+            % (expected.strip().replace("\n", " "), actual.strip().replace("\n", " ")),
+        )
+
+
+# ---------------------------------------------------------------- main
+
+
+def main() -> int:
+    state = load_state()
+
+    os.makedirs(RUNTIME_DIR, exist_ok=True)
+    with open(PID_FILE, "w") as fh:
+        fh.write("%d\n" % os.getpid())
+
+    def on_action(signum, _frame):
+        state["action_seq"] += 1
+        save_state(state)
+        publish_world(state)
+        log("INFO", "action recorded -> action_seq=%d" % state["action_seq"])
+
+    def on_term(signum, _frame):
+        log("INFO", "shutting down at action_seq=%d" % state["action_seq"])
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGUSR1, on_action)
+    signal.signal(signal.SIGTERM, on_term)
+    signal.signal(signal.SIGINT, on_term)
+
+    log(
+        "INFO",
+        "autonomic-agentd %s up (uid=%d gid=%d world=%s#%d)"
+        % (
+            VERSION,
+            os.getuid(),
+            os.getgid(),
+            state["snapshot_id"],
+            state["action_seq"],
+        ),
+    )
+
+    publish_world(state)
+    while True:
+        check_drift(state)
+        publish_world(state)
+        time.sleep(TICK_SECONDS)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,21 @@
+#!/usr/bin/make -f
+# Autonomic OS -- autonomic-agent
+#
+# 刻意不用任何语言特定的构建系统：这个包目前只是把已经写好的文件
+# 放到正确的位置，剩下的（用户、目录、unit 启用）交给 postinst 和
+# debhelper 生成的 systemd 片段。
+#
+# 可复现构建：SOURCE_DATE_EPOCH 由 build/build.sh 导出，
+# 别在这里用 date。
+
+export DH_VERBOSE=1
+
+%:
+	dh $@
+
+# 没有上游构建系统，全部跳过（否则 dh 会去找 Makefile）
+override_dh_auto_configure:
+override_dh_auto_build:
+override_dh_auto_test:
+override_dh_auto_install:
+override_dh_auto_clean:

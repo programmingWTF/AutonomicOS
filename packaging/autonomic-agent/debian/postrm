@@ -1,0 +1,25 @@
+#!/bin/sh
+# postrm -- purge 时必须清洁：不留用户、不留组、不留状态、不留日志。
+# （remove 与 upgrade 时不动任何东西：升级要保住 action_seq。）
+set -e
+
+AGENT_USER=autonomic
+AGENT_GROUP=autonomic
+
+case "$1" in
+    purge)
+        if getent passwd "$AGENT_USER" >/dev/null; then
+            deluser --system --quiet "$AGENT_USER" || true
+        fi
+        if getent group "$AGENT_GROUP" >/dev/null; then
+            delgroup --only-if-empty --quiet "$AGENT_GROUP" || true
+        fi
+        rm -rf /var/lib/autonomic
+        rm -rf /run/autonomic
+        rm -rf /var/log/journal/autonomic
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

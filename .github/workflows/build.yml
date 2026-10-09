@@ -1,0 +1,85 @@
+name: build
+
+# 可复现构建是本项目唯一能给出的信用替代品（CHARTER §1.4）。
+# 这个 workflow 干三件事：构建、验证"再编一次还是同一个包"、把仓库发成静态站点。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            dpkg-dev debhelper fakeroot apt-utils
+
+      - name: Build the .deb
+        run: ./build/build.sh
+
+      - name: Reproducibility check -- build twice, must be byte-identical
+        run: |
+          a=$(sha256sum dist/*.deb | awk '{print $1}')
+          ./build/build.sh
+          b=$(sha256sum dist/*.deb | awk '{print $1}')
+          echo "first : $a"
+          echo "second: $b"
+          if [ "$a" != "$b" ]; then
+            echo "::error::not reproducible -- the same tree produced two different .deb files"
+            exit 1
+          fi
+          echo "reproducible"
+
+      - name: Build the signed apt repository
+        env:
+          AUTONOMIC_GPG_PRIVATE_KEY: ${{ secrets.AUTONOMIC_GPG_PRIVATE_KEY }}
+        run: |
+          # 没有密钥时用 make-repo.sh 自己生成的开发密钥签名，
+          # 产物依然可用，只是不该被当作发布物信任。
+          if [ -n "$AUTONOMIC_GPG_PRIVATE_KEY" ]; then
+            printf '%s' "$AUTONOMIC_GPG_PRIVATE_KEY" | gpg --batch --import
+          fi
+          ./repo/make-repo.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb
+          path: dist/*.deb
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apt-repo
+          path: repo/out/
+
+  # 仓库是纯静态目录 —— 任何静态托管都能当 apt 源。
+  # 需要在仓库设置里把 Pages 的 source 改成 "GitHub Actions"。
+  publish:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: apt-repo
+          path: repo
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: repo
+      - id: deployment
+        uses: actions/deploy-pages@v4

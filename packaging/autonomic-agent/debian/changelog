@@ -1,0 +1,8 @@
+autonomic-agent (0.1.0-1) unstable; urgency=medium
+
+  * Initial release. M1: the agent gets an identity in the system --
+    dedicated system user, hardened systemd unit, cgroup quota, own
+    journal namespace, read-only world-version marker at
+    /run/autonomic/world with drift detection.
+
+ -- Autonomic OS <contact@liguiyu.com>  Fri, 09 Oct 2026 21:30:00 +0800

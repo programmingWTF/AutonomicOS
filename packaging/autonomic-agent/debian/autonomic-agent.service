@@ -1,0 +1,48 @@
+[Unit]
+Description=Autonomic Agent - the system's agent-native identity
+Documentation=https://github.com/programmingWTF/AutonomicOS
+After=network.target
+
+[Service]
+Type=simple
+User=autonomic
+Group=autonomic
+ExecStart=/usr/sbin/autonomic-agentd
+Restart=on-failure
+RestartSec=5s
+
+# ---- 身份之一：它自己的审计流，不与系统日志混在一起 ----
+# journalctl --namespace=autonomic 才能看到它
+SyslogIdentifier=autonomic-agent
+LogNamespace=autonomic
+
+# ---- 它自己的可写目录（systemd 负责创建 + chown，包里不需要 mkdir）----
+StateDirectory=autonomic
+StateDirectoryMode=0750
+RuntimeDirectory=autonomic
+RuntimeDirectoryMode=0755
+
+# ---- 身份之一：它占用资源是受控的（cgroup 限额）----
+MemoryMax=256M
+MemoryHigh=192M
+CPUQuota=25%
+TasksMax=64
+
+# ---- hardening：它是系统里的一个受限主体，不是一个 root 脚本 ----
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

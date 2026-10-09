@@ -1,0 +1,22 @@
+Source: autonomic-agent
+Section: admin
+Priority: optional
+Maintainer: Autonomic OS <contact@liguiyu.com>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+Homepage: https://github.com/programmingWTF/AutonomicOS
+
+Package: autonomic-agent
+Architecture: all
+Depends: ${misc:Depends}, python3, adduser
+Description: agent-native identity layer for Debian and Ubuntu
+ Gives the agent an identity in the system instead of a process:
+ a dedicated system user, a hardened systemd unit, its own cgroup
+ quota, its own journal namespace, and a read-only world-version
+ marker used to detect changes that bypassed the Action channel.
+ .
+ Part of Autonomic OS -- a research prototype. It reuses the Debian
+ and Ubuntu bones (kernel, glibc, systemd, dpkg) and adds a layer of
+ agent-native defaults. No warranty beyond "this release built and
+ ran at the time it was published".

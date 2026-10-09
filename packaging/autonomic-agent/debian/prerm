@@ -1,0 +1,7 @@
+#!/bin/sh
+# prerm -- 服务的停止由 debhelper 生成的代码处理（见 #DEBHELPER#）。
+set -e
+
+#DEBHELPER#
+
+exit 0

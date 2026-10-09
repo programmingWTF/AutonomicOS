@@ -1,0 +1,45 @@
+#!/bin/sh
+# postinst -- 建立 Agent 的"身份"：专有系统用户 + 它自己的状态目录。
+#
+# 这里刻意不碰 systemd 的 enable/start：那段由 debhelper 生成，
+# 插入在下面的 #DEBHELPER# 位置。顺序很重要 —— 用户必须先存在，
+# 服务才能以 User=autonomic 启动，所以自定义代码放在 #DEBHELPER# 之前。
+
+set -e
+
+AGENT_USER=autonomic
+AGENT_GROUP=autonomic
+STATE_DIR=/var/lib/autonomic
+
+case "$1" in
+    configure)
+        # ---- 身份 1/5：专有系统用户（UID/GID 由系统分配，不硬编码）----
+        if ! getent passwd "$AGENT_USER" >/dev/null; then
+            adduser --system \
+                    --group \
+                    --no-create-home \
+                    --home "$STATE_DIR" \
+                    --gecos "Autonomic Agent" \
+                    --quiet \
+                    "$AGENT_USER" || true
+        fi
+
+        # ---- 它自己的状态目录 ----
+        # systemd 的 StateDirectory= 也会建，但包刚装上、服务还没起来时
+        # 目录就应该已经存在且归属正确。
+        mkdir -p "$STATE_DIR"
+        chown "$AGENT_USER:$AGENT_GROUP" "$STATE_DIR"
+        chmod 0750 "$STATE_DIR"
+
+        if [ ! -f "$STATE_DIR/state.json" ]; then
+            printf '%s\n' '{"snapshot_id": "bootstrap", "action_seq": 0}' \
+                > "$STATE_DIR/state.json"
+            chown "$AGENT_USER:$AGENT_GROUP" "$STATE_DIR/state.json"
+            chmod 0640 "$STATE_DIR/state.json"
+        fi
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

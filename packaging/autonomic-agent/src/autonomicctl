@@ -1,0 +1,193 @@
+#!/usr/bin/python3
+"""autonomicctl -- ask the system how it sees the agent.
+
+The point of this tool is the ``status`` subcommand: one command that shows
+the agent is a *role in the system* (a user, a unit, a cgroup, a journal
+namespace, a world marker) rather than a pile of scripts someone left
+running.
+
+  autonomicctl status   the whole identity, in one screen
+  autonomicctl world    the read-only world-version marker
+  autonomicctl bump     record one Action through the channel (action_seq += 1)
+  autonomicctl version
+"""
+
+from __future__ import annotations
+
+import argparse
+import grp
+import json
+import os
+import pwd
+import signal
+import subprocess
+import sys
+
+VERSION = "0.1.0"
+
+UNIT = "autonomic-agent.service"
+AGENT_USER = "autonomic"
+STATE_FILE = "/var/lib/autonomic/state.json"
+WORLD_MARKER = "/run/autonomic/world"
+PID_FILE = "/run/autonomic/agent.pid"
+
+
+def _run(cmd: list[str]) -> str:
+    try:
+        out = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=10
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return out.stdout.strip() if out.returncode == 0 else ""
+
+
+def _systemctl_show(*props: str) -> dict:
+    out = _run(["systemctl", "show", "-p", ",".join(props), UNIT])
+    result = {}
+    for line in out.splitlines():
+        if "=" in line:
+            k, _, v = line.partition("=")
+            result[k.strip()] = v.strip()
+    return result
+
+
+def _read(path: str) -> str:
+    try:
+        with open(path, "r") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def _cgroup_limits() -> dict:
+    """Read the quota straight out of cgroupfs -- that is the proof."""
+    cg = _systemctl_show("ControlGroup").get("ControlGroup", "")
+    out = {}
+    if cg and cg != "/":
+        base = "/sys/fs/cgroup" + cg
+        for key, fname in (("memory.max", "memory.max"), ("cpu.max", "cpu.max")):
+            val = _read(os.path.join(base, fname))
+            if val:
+                out[key] = val
+    return out
+
+
+def _agent_pid() -> int:
+    pid = _systemctl_show("MainPID").get("MainPID", "")
+    if pid.isdigit() and int(pid) > 0:
+        return int(pid)
+    raw = _read(PID_FILE)
+    return int(raw) if raw.isdigit() else 0
+
+
+def _proc_uid(pid: int) -> str:
+    if not pid:
+        return "n/a"
+    for line in _read("/proc/%d/status" % pid).splitlines():
+        if line.startswith("Uid:"):
+            return line.split()[1]
+    return "n/a"
+
+
+def cmd_status(_args: argparse.Namespace) -> int:
+    info = _systemctl_show(
+        "ActiveState", "SubState", "MainPID", "MemoryMax", "CPUQuotaPerSecUSec"
+    )
+    active = info.get("ActiveState", "unknown")
+    sub = info.get("SubState", "unknown")
+    pid = _agent_pid()
+
+    # ---- identity: a user the system knows about ----
+    try:
+        pw = pwd.getpwnam(AGENT_USER)
+        identity = "%s (uid=%d gid=%d)" % (pw.pw_name, pw.pw_uid, pw.pw_gid)
+        try:
+            grp_entry = grp.getgrgid(pw.pw_gid)
+            identity += " group=%s" % grp_entry.gr_name
+        except KeyError:
+            pass
+    except KeyError:
+        identity = "MISSING (user %s does not exist)" % AGENT_USER
+
+    print("Autonomic Agent %s" % VERSION)
+    print()
+    print("  identity   : %s" % identity)
+    print(
+        "  process    : pid=%s running-as-uid=%s"
+        % (pid if pid else "n/a", _proc_uid(pid))
+    )
+    print("  unit       : %s%s" % (UNIT, ""))
+    print("  state      : %s (%s)" % (active, sub))
+
+    # ---- cgroup: its resource use is bounded ----
+    limits = _cgroup_limits()
+    if not limits:
+        limits = {
+            k: v
+            for k, v in (
+                ("MemoryMax", info.get("MemoryMax", "")),
+                ("CPUQuotaPerSecUSec", info.get("CPUQuotaPerSecUSec", "")),
+            )
+            if v and v != "infinity"
+        }
+    print("  cgroup     : %s" % (", ".join("%s=%s" % kv for kv in sorted(limits.items())) or "n/a"))
+    print("  journal    : journalctl --namespace=autonomic")
+    print("  world      : %s" % (_read(WORLD_MARKER).replace("\n", " ") or "n/a"))
+    print("  state file : %s" % STATE_FILE)
+    print()
+
+    ok = active == "active" and sub == "running"
+    print(
+        "  => %s"
+        % (
+            "the agent is a role in this system, not a pile of scripts"
+            if ok
+            else "NOT RUNNING -- this machine does not currently host an agent"
+        )
+    )
+    return 0 if ok else 1
+
+
+def cmd_world(_args: argparse.Namespace) -> int:
+    marker = _read(WORLD_MARKER)
+    if not marker:
+        print("no world marker at %s" % WORLD_MARKER, file=sys.stderr)
+        return 1
+    print(marker)
+    try:
+        with open(STATE_FILE) as fh:
+            print("# source of truth: %s" % json.load(fh))
+    except (OSError, ValueError):
+        pass
+    return 0
+
+
+def cmd_bump(_args: argparse.Namespace) -> int:
+    pid = _agent_pid()
+    if not pid:
+        print("agent is not running", file=sys.stderr)
+        return 1
+    os.kill(pid, signal.SIGUSR1)
+    print("action recorded through the channel (pid=%d)" % pid)
+    return 0
+
+
+def cmd_version(_args: argparse.Namespace) -> int:
+    print("autonomicctl %s" % VERSION)
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="autonomicctl", description=__doc__)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("status", help="show the agent's identity in this system").set_defaults(fn=cmd_status)
+    sub.add_parser("world", help="show the read-only world-version marker").set_defaults(fn=cmd_world)
+    sub.add_parser("bump", help="record one Action through the channel").set_defaults(fn=cmd_bump)
+    sub.add_parser("version", help="print version").set_defaults(fn=cmd_version)
+    args = ap.parse_args()
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

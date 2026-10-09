@@ -1,0 +1,2 @@
+src/autonomic-agentd usr/sbin
+src/autonomicctl usr/bin

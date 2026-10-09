@@ -1,0 +1,32 @@
+# ---- 构建产物 ----
+dist/
+build/.tmp/
+*.deb
+*.dsc
+*.tar.*
+*.buildinfo
+*.changes
+*.build
+
+# ---- apt 仓库（本地产物，可重建）----
+repo/out/
+repo/pool/
+repo/dists/
+repo/*.deb
+
+# ---- 密钥：绝不入库 ----
+*.key
+*.asc.priv
+secrets/
+.gnupg/
+repo/gnupg/
+*.gpg.tmp
+
+# ---- Python ----
+__pycache__/
+*.pyc
+
+# ---- 杂项 ----
+.DS_Store
+Thumbs.db
+desktop.ini
