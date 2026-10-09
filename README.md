@@ -3,10 +3,13 @@
 > **在 Debian/Ubuntu 之上，做一个"Agent 原生层 + 一套默认值"的可安装系统：
 > 不重写系统，而是让系统第一次把 Agent 当成自己的器官。**
 
+- **对外英文名：`Autonomic OS`**（桂鱼 2026-10-09 定）；中文名待定
 - 定位：**research prototype** —— 只承诺"这个 release 当时能跑"
 - 第一性原理：`docs/CHARTER.md`（不可违背）
-- 命名：暂定 `Autonomic OS`，**最终定名由桂鱼裁决**（候选与理由见 `docs/Naming.md`）
 - 代码目录：`D:\Code\AutonomicOS`；旧 `D:\Code\AOS` 是**只读参考**，定位已换代
+
+> 最终目标：**一个可以安装在计算机里的操作系统，且原生支持 Agent。**
+> 路线是 仓库 → 包 → 镜像，骨头全部来自 Debian/Ubuntu，我们只加一层默认值。
 
 ---
 
