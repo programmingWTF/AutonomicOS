@@ -118,6 +118,91 @@ check("dispatch 挡住不在列表里的 shell", r["ok"] is False, str(r.get("de
 r = act.dispatch("no.such.action", {}, "dry_run")
 check("dispatch 挡住未登记的 action", r["ok"] is False, str(r.get("detail")))
 
+print()
+print("dispatcher 必须强制覆盖 reversible —— 这是实测抓出来的静默漏洞")
+
+# 这个 bug 的危害值得写清：ok() 的默认参数是 reversible=True，
+# 而 dispatch 原来用 setdefault 填 reversible。两者一叠加，**任何**返回
+# ok(...) 却没显式传 reversible 的 handler，dry_run 都会被报成"可逆"。
+#
+# 症状（2026-10-11 装机验收实测）：user.add 登记为 reversible=False，
+# `actions` 列表也正确显示"不可逆"，但它的 dry_run 输出是"可逆：是" ——
+# 于是 cmd_act 里那道两级授权拦截根本不触发，一个不可逆的动作
+# 可以被一句 --yes 带过。
+#
+# 这里三处都要断言，因为它们各自都会被"只改一处"的修法绕过：
+#   1) 登记值      —— @register 说了什么
+#   2) dry_run 返回值 —— 人第一次看到的东西
+#   3) apply  返回值 —— 落地时依据的东西
+
+dr = act.dispatch("user.add", {"name": "aos-probe"}, "dry_run")
+check("user.add dry_run 里 reversible 必须是 False（不是 ok() 的默认 True）",
+      dr.get("reversible") is False, "dry_run.reversible = %r" % dr.get("reversible"))
+
+# 上面那条在非 Linux 上走的是"pwd 模块不存在"的异常分支 —— 能过，
+# 但没测到 user.add 真正的正常路径。把平台相关的查表函数换掉，
+# 就能在任何系统上走一遍它该走的路。**这正是把 _passwd_lookup 抽出来的理由。**
+print()
+print("user.add 的正常路径（把平台查表替换掉，任何系统都能测）")
+_saved_lookup = act._passwd_lookup
+try:
+    act._passwd_lookup = lambda n: None          # 假装这个用户还不存在
+    r = act.dispatch("user.add", {"name": "aos-probe", "shell": "/bin/sh"},
+                     "dry_run")
+    check("新用户 dry_run 成功且报'将新建'",
+          r.get("ok") is True and "将新建" in r.get("detail", ""),
+          str(r.get("detail")))
+    check("该 dry_run 的 reversible 仍是 False（不被 ok() 默认值污染）",
+          r.get("reversible") is False, "got %r" % r.get("reversible"))
+    check("dry_run 的 already_exists 是 False",
+          r.get("evidence", {}).get("already_exists") is False,
+          str(r.get("evidence")))
+
+    act._passwd_lookup = lambda n: {"uid": 1001, "home": "/home/" + n,
+                                    "shell": "/bin/sh"}
+    r2 = act.dispatch("user.add", {"name": "aos-probe", "shell": "/bin/sh"},
+                      "dry_run")
+    check("已存在的用户 dry_run 报 changed=False 且说'已经存在'",
+          r2.get("ok") is True and r2.get("changed") is False
+          and "已经存在" in r2.get("detail", ""), str(r2.get("detail")))
+
+    act._passwd_lookup = lambda n: {"uid": 1001, "home": "/home/" + n,
+                                    "shell": "/bin/bash"}
+    r3 = act.dispatch("user.add", {"name": "aos-probe", "shell": "/bin/sh"},
+                      "verify")
+    check("verify 发现 shell 与目标不符时判失败",
+          r3.get("ok") is False and "shell" in r3.get("detail", ""),
+          str(r3.get("detail")))
+finally:
+    act._passwd_lookup = _saved_lookup
+
+dr_ok = act.dispatch("pkg.list", {}, "dry_run")
+check("pkg.list（只读可逆）的 dry_run 仍报 True",
+      dr_ok.get("reversible") is True, "got %r" % dr_ok.get("reversible"))
+
+# 反过来钉一条：如果某个 handler 在返回值里**撒谎**说自己是可逆的，
+# dispatcher 也必须把它纠正回来 —— 可逆性只认 @register 那一处。
+print()
+print("可逆性只认一处声明：handler 自己撒谎也纠正回来")
+_orig = act.ACTIONS["user.add"]
+_saved = _orig
+
+
+def _lying_handler(params, phase):
+    return act.ok("我在撒谎，声称自己可逆", reversible=True)
+
+
+_lying_handler.action_name = "user.add"
+_lying_handler.reversible = False          # 登记说是不可逆
+_lying_handler.schema = ("name",)
+act.ACTIONS["user.add"] = _lying_handler
+try:
+    r = act.dispatch("user.add", {"name": "x"}, "dry_run")
+    check("handler 声称 reversible=True，dispatcher 仍按登记的 False 纠正",
+          r.get("reversible") is False, "got %r" % r.get("reversible"))
+finally:
+    act.ACTIONS["user.add"] = _saved
+
 # catalogue 必须把这些新原语也报出去 —— 否则 LLM 永远规划不到它们
 names = {c["name"] for c in act.catalogue()}
 for want in ("pkg.install", "pkg.remove", "pkg.list", "user.add"):

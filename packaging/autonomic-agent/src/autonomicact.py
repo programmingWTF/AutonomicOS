@@ -132,29 +132,58 @@ def _check_schema(schema: tuple, params: dict) -> tuple[dict, str]:
 
 
 def dispatch(action: str, params: dict, phase: str) -> dict:
-    """唯一的入口。actd 只调这个，不直接碰 action 函数。"""
+    """唯一的入口。actd 只调这个，不直接碰 action 函数。
+
+    ⚠️ 这个函数最关键的一件事不是"调用 handler"，而是**让 reversible
+    只能有一个来源**。
+
+    踩过的坑（2026-10-11 装机验收实测抓到）：原来这里用
+    ``result.setdefault("reversible", fn.reversible)``，而 ``ok()`` 的
+    默认参数就是 ``reversible=True``。两者一叠加 —— **任何**返回 ``ok(...)``
+    却没显式传 reversible 的 handler，dry_run 都会被报成"可逆"。
+
+    症状：``user.add`` 登记为 ``reversible=False``，``autonomicctl actions``
+    也正确显示"不可逆"，但它的 dry_run 输出是"可逆：是" —— 于是
+    ``cmd_act`` 里那道两级授权拦截 ``if not preview.get("reversible")``
+    **根本不触发**，一个不可逆的动作可以被一句 ``--yes`` 带过。
+
+    而且早返回的路径（未知 action / 参数不合格 / handler 抛异常）都走
+    ``fail()``，那个函数也硬写着 ``reversible: True`` —— 一并在下面收口。
+
+    教训：可逆性**只能声明一次**（``@register``），别处一律是副本，
+    而副本会撒谎。所以这里不是在"填默认值"，是**强制覆盖**。
+    """
+
+    def seal(res: dict, known: bool = True) -> dict:
+        """把所有返回路径都收口：可逆性只认登记值，谁说了都不算。
+
+        known=False 表示连 action 都没认出来（未知阶段 / 未知 action），
+        这时无可逆性可言，如实标成 None，别假装它"可逆"。
+        """
+        res["reversible"] = fn.reversible if known else None
+        res.setdefault("phase", phase)
+        res.setdefault("action", action)
+        return res
+
     if phase not in ("dry_run", "apply", "verify"):
-        return fail("未知阶段 %r（dry_run | apply | verify）" % phase)
+        return seal(fail("未知阶段 %r（dry_run | apply | verify）" % phase), False)
 
     fn = ACTIONS.get(action)
     if fn is None:
-        return fail(
+        return seal(fail(
             "未知 action %r。已登记的：%s" % (action, ", ".join(sorted(ACTIONS)))
-        )
+        ), False)
 
     checked, why = _check_schema(fn.schema, params)
     if why:
-        return fail(why)
+        return seal(fail(why))
 
     try:
         result = fn(checked, phase)
     except Exception as exc:  # 不能让一个 action 把 daemon 带走
-        return fail("%s 在 %s 阶段出错：%s: %s"
-                    % (action, phase, type(exc).__name__, exc))
-    result.setdefault("reversible", fn.reversible)
-    result.setdefault("phase", phase)
-    result.setdefault("action", action)
-    return result
+        return seal(fail("%s 在 %s 阶段出错：%s: %s"
+                         % (action, phase, type(exc).__name__, exc)))
+    return seal(result)
 
 
 def catalogue() -> list:
@@ -739,6 +768,36 @@ def act_pkg_list(params: dict, phase: str) -> dict:
 # 用户名：POSIX 可移植字符集，不能以 - 开头，不能是纯数字（会撞 UID）
 _USER_RE = r"^[a-z_][a-z0-9_-]{0,31}$"
 
+# 允许的登录 shell。**白名单**，不是"看着像路径就放行"：
+# 让调用者指定任意路径 = 让他在 /etc/passwd 里挂一个任意可执行文件，
+# 而 /etc/passwd 恰好在 DENYLIST 上正是为了不让通道改它 —— 那么从
+# 这里开后门就毫无意义了。
+_ALLOWED_SHELLS = (
+    "/bin/bash", "/bin/sh", "/bin/zsh", "/usr/bin/fish",
+    "/usr/sbin/nologin", "/bin/false",
+)
+
+
+def _passwd_lookup(name: str) -> dict | None:
+    """查一个用户在 /etc/passwd 里的条目；没有就返回 None。
+
+    单独抽出来是为了两件事：
+      1. 让 act_user_add 的三个阶段共用同一个"真相来源"，而不是各写一遍
+         try/import/except（三份副本迟早会漂移）；
+      2. 让这段平台相关的代码**可以在测试里被替换掉** —— `pwd` 模块只有
+         POSIX 有，不抽出来的话，在非 Linux 上跑测试时 user.add 永远只会
+         走到"ModuleNotFoundError"那一条分支，dry_run 的正常路径一次都测不到。
+    """
+    try:
+        import pwd
+    except ImportError:
+        return None
+    try:
+        ent = pwd.getpwnam(name)
+    except KeyError:
+        return None
+    return {"uid": ent.pw_uid, "home": ent.pw_dir, "shell": ent.pw_shell}
+
 
 @register("user.add", ("name", "shell?", "groups?", "gecos?"), reversible=False)
 def act_user_add(params: dict, phase: str) -> dict:
@@ -750,22 +809,28 @@ def act_user_add(params: dict, phase: str) -> dict:
     if not re.match(_USER_RE, name):
         return fail("用户名 %r 不合法（小写字母/下划线开头，后接字母数字_-，最长 32）"
                     % name)
-    if shell not in ("/bin/bash", "/bin/sh", "/bin/zsh", "/usr/bin/fish",
-                     "/usr/sbin/nologin", "/bin/false"):
-        return fail("shell %r 不在允许列表里" % shell)
+    if shell not in _ALLOWED_SHELLS:
+        return fail("shell %r 不在允许列表里：%s"
+                    % (shell, ", ".join(_ALLOWED_SHELLS)))
     if groups and any(c in groups for c in " ;|$&`'\""):
         return fail("groups 里有可疑字符：%r" % groups)
 
-    try:
-        import pwd as _pwd
-        exists = _pwd.getpwnam(name) is not None
-    except KeyError:
-        exists = False
+    existing = _passwd_lookup(name)
 
     evidence = {"name": name, "shell": shell, "groups": groups,
-                "already_exists": exists}
+                "already_exists": existing is not None}
 
-    if exists:
+    # ⚠️ 这个"已经存在就早返回"**只能用在 dry_run**。
+    #
+    # 一开始它写在三个阶段前面，结果 verify 变成了一个空操作：
+    # apply 建完用户，verify 一看"用户存在"就报成功返回 —— 可它从没检查过
+    # 建出来的那个用户 shell 对不对、uid 是不是我们要的。**verify 的全部
+    # 价值就是"去现场把 apply 承诺的每一项再数一遍"，提前返回等于自己
+    # 把这一步废掉了。**
+    #
+    # 所以：dry_run 看到"已存在"可以说"无需改动"（这是给操作者的预告）；
+    # verify 必须继续往下走到真正的核对。
+    if existing is not None and phase == "dry_run":
         return ok("用户 %s 已经存在" % name, changed=False, evidence=evidence)
 
     if phase == "dry_run":
@@ -774,6 +839,12 @@ def act_user_add(params: dict, phase: str) -> dict:
                   evidence=evidence)
 
     if phase == "apply":
+        # 已经存在就别再 useradd 了 —— 它会失败，而"你要建的用户早就有了"
+        # 不是一次失败，是一次"无需改动"。apply 也不该把已经正确的事再报
+        # 成"我改了它"：世界版本号是要为真实变更 +1 的。
+        if existing is not None:
+            return ok("用户 %s 已经存在，无需新建" % name, changed=False,
+                      evidence=evidence)
         argv = ["useradd", "-m", "-s", shell]
         if gecos:
             argv += ["-c", gecos]
@@ -786,19 +857,16 @@ def act_user_add(params: dict, phase: str) -> dict:
             return fail("useradd 失败（rc=%d）：%s" % (rc, out), evidence)
         return ok("已新建用户 %s" % name, evidence=evidence)
 
-    # verify
-    try:
-        import pwd as _pwd
-        ent = _pwd.getpwnam(name)
-    except KeyError:
+    # verify：去 /etc/passwd 再看一眼，而不是相信 useradd 的返回码
+    ent = _passwd_lookup(name)
+    if ent is None:
         return fail("verify 失败：用户 %s 不存在" % name, evidence)
-    evidence["uid"] = ent.pw_uid
-    evidence["home"] = ent.pw_dir
-    if ent.pw_shell != shell:
-        return fail("verify 失败：shell 是 %s，期望 %s" % (ent.pw_shell, shell),
+    evidence.update(ent)
+    if ent["shell"] != shell:
+        return fail("verify 失败：shell 是 %s，期望 %s" % (ent["shell"], shell),
                     evidence)
-    return ok("已核实用户 %s（uid=%d，家目录 %s）" % (name, ent.pw_uid, ent.pw_dir),
-              changed=False, evidence=evidence)
+    return ok("已核实用户 %s（uid=%d，家目录 %s）"
+              % (name, ent["uid"], ent["home"]), changed=False, evidence=evidence)
 
 
 # ------------------------------------------------------------------ action: self.test
