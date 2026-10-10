@@ -32,6 +32,11 @@ jobs:
       - name: Planner self-check (parse + validation)
         run: python3 scripts/test-plan.py
 
+      # 原语的参数校验是"执行别人代码"（pkg.install 的 postinst 以 root 跑）
+      # 之前的最后一关，值得同样钉在 CI 上。
+      - name: Primitives self-check (pkg.* / user.* guards)
+        run: python3 scripts/test-primitives.py
+
       - name: Reproducibility check -- build twice, must be byte-identical
         run: |
           a=$(sha256sum dist/*.deb | awk '{print $1}')

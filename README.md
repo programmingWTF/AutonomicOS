@@ -48,6 +48,7 @@
 | **M5** 通道 | ✅ | **Action 通道**：dry_run / apply / verify 三段 + 可逆性声明 + `file.restore` |
 | **M6** 向导 | ✅ | 装机 TUI（whiptail）：选盘 → 二次手打设备名 → 主机名 → 用户 → LLM（可跳过） |
 | **M7** 闭环 | ✅ | `autonomicctl ask "…"`：说人话进，受校验的动作出；模型提议，通道裁决 |
+| **M8** 原语 | ✅ | 通道从 5 个动作扩到 9 个：`pkg.*`（装包/卸包/查询）、`user.add`（第一个不可逆动作） |
 
 每次 push 由 CI 编两遍比对 sha256 发布；apt 仓库是静态站点，丢任何 HTTPS 托管上都能用。
 
@@ -90,8 +91,17 @@ autonomic-agentd   uid=autonomic，ProtectSystem=strict —— 它能思考，�
         │          unix socket，0660 root:autonomic
         │          连接建立后先用 SO_PEERCRED 验身份，请求字节还没解析就可能被拒
         ▼
-autonomic-actd     root，但只认四个登记过的原语，读写路径锁在四个前缀内
+autonomic-actd     root，但只认九个登记过的原语，读写路径锁在四个前缀内
 ```
+
+| 原语 | 做什么 | 可逆 |
+|---|---|---|
+| `file.write` / `file.restore` | 改文件 / 把备份放回原位 | 是 |
+| `service.set` | systemd 单元的启停与自启 | 是 |
+| `sysctl.set` | 内核参数（写入 `/etc/sysctl.d/` 且立刻生效） | 是 |
+| `pkg.install` / `pkg.remove` / `pkg.list` | 安装 / 卸载 / 查询软件包 | 是（配置残留归 purge 管） |
+| `user.add` | 新建账户 | **否** —— 见下 |
+| `self.test` | 通道自身的体检 | 是 |
 
 每个 action 必须回答三个问题，而不是给一个承诺：
 
@@ -169,6 +179,24 @@ $ sudo autonomicctl ask "把通道自检再做一遍"
 - **没有 shell 逃生口。** 缺能力就承认缺，加原语。一旦开了"内置动作不够就用 shell"
   的口子，上面全部退化成装饰。
 
+### 加原语，不加权力
+
+让 AI 真的能把这台机器变成用户想要的样子，靠的是**加原语**，不是放宽约束。
+`pkg.*` 和 `user.add` 是第一批真正"碰到底层"的动作，所以它们的规矩写在代码里，
+别处不许松：
+
+- **装包是这个通道上第一个执行"别人写的代码"的动作** —— apt 的 postinst 以 root 跑。
+  因此包名必须匹配 Debian 合法字符集、**不许以 `-` 开头**（否则 `--allow-unauthenticated`
+  之类的字符串会被 apt 当成自己的选项吃下去）、不许带 `=` 指定版本（能挑版本，就能挑到
+  一个有洞的版本）、一次最多 5 个包。爆炸半径写在代码里，不写在对面的自律里。
+- **`user.add` 是全通道第一个不可逆动作，也是第一次让"两级授权"真正派上用场。**
+  删掉一个用户，不会把它创建过的文件、跑过的服务、写进配置里的 UID 一起带走 ——
+  把"删了用户"当成"回到没建过这个用户"是错的。所以它声明 `reversible=False`，
+  于是调用侧除了 `--yes` 还必须再加 `--force-irreversible`。
+  **这个额外的停顿就是安全机制本身，不是走过场。**
+- 即便不可逆，规矩仍然一致：dry_run 先把依赖树算给你看（`apt-get -s`，免费），
+  verify 不看 apt 说了什么、只问 `dpkg-query` 现在是什么状态。
+
 ### 为什么这套东西不是花架子
 
 每次 apply 成功都会让 `action_seq` +1，而这个计数器投影出 `/run/autonomic/world`。
@@ -180,7 +208,8 @@ Action 通道，agent 下一个 tick 就会 WARN 并纠正回来。这是整套�
 ### 不花一分钱地验证这一切
 
 ```bash
-python3 scripts/test-plan.py          # 21 项：解析与校验逻辑（纯函数，跑得飞快）
+python3 scripts/test-plan.py          # 21 项：计划解析与校验（纯函数，跑得飞快）
+python3 scripts/test-primitives.py    # 39 项：pkg.* / user.* 的参数守卫
 python3 scripts/mock-llm.py &         # 一个假的 OpenAI-compatible 端点
 sudo autonomicctl setup --base-url http://127.0.0.1:8099/v1 \
     --api-key mock --model mock-1 --non-interactive
@@ -218,7 +247,7 @@ sudo autonomicctl ask "把通道自检再做一遍"
 ## 目录
 
 ```
-docs/                        CHARTER.md（第一性原理，不可违背）· M1.md · M2.md · M3.md · M7.md
+docs/                        CHARTER.md（第一性原理，不可违背）· M1.md · M2.md · M3.md · M7.md · M8.md
 packaging/autonomic-agent/   debian/ + src/
                                autonomic-agentd   身份守护进程（无特权）
                                autonomic-actd     通道的执行半边（有特权、有边界）
@@ -229,6 +258,7 @@ packaging/autonomic-agent/   debian/ + src/
 build/                       build.sh · build-rootfs.sh · make-iso.sh · autonomic-install
 scripts/                     install-test.sh（装机全自动验收）· boot-test.sh
                              test-plan.py（21 项纯逻辑自检，CI 必跑）
+                             test-primitives.py（39 项原语参数守卫自检，CI 必跑）
                              mock-llm.py（假模型端点：没有 key 也能验整条 AI 路径）
 ```
 

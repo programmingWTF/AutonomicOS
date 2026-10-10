@@ -41,6 +41,7 @@ import hashlib
 import json
 import os
 import posixpath
+import re
 import shutil
 import socket
 import subprocess
@@ -546,6 +547,245 @@ def act_sysctl_set(params: dict, phase: str) -> dict:
                     % (key, SYSCTL_FILE), evidence)
     return ok("已核实 %s = %s 且已持久化" % (key, value), changed=False,
               evidence=evidence)
+
+
+# ------------------------------------------------------------------ action: pkg.*
+#
+# 软件包是这个系统"还是 Linux"的证明：能装 nginx 就能当服务器，能装 gcc 就能
+# 编译，能装 python3 就能跑你自己的东西。没有 pkg.*，通道就只是"能改配置的
+# 玩具"；有了它，AI 才真的能把这台机器变成用户想要的样子。
+#
+# 但 pkg.* 是这套设计里第一个**执行别人写的代码**的原语：apt 的 postinst
+# 以 root 跑，装进来什么就执行什么。所以规则写死在这里，别处不许松：
+#
+#   1. 只走 `apt-get`，且参数逐个给出（argv 列表），**绝不经过 shell** ——
+#      包名里任何一个 `;` `|` `$` 都到不了 shell，因为压根没有 shell。
+#   2. 包名必须匹配 Debian 的合法字符集，且**不许以 `-` 开头** ——
+#      否则 `--allow-unauthenticated` 这种东西会被 apt 当成自己的选项吃掉。
+#   3. 不许带版本、不许带 `=`、不许带通配符。要装什么版本由仓库决定，
+#      不由提议者决定：能指定版本就能把它降到一个有洞的版本。
+#   4. 一次最多装/卸 5 个包。爆炸半径写死在代码里，不写在对面的自律里。
+
+# Debian 包名（policy 7.6）：小写字母数字与 + - . ，必须以字母数字开头。
+_PKG_RE = r"^[a-z0-9][a-z0-9+.\-]*$"
+MAX_PKGS_PER_ACTION = 5
+APT_TIMEOUT = 300
+
+
+def _split_packages(raw) -> tuple[list, str]:
+    """把 "nginx, curl" 拆成 [nginx, curl] 并逐个校验。
+
+    也接受已经在列表里的形式（LLM 有时直接给数组）。返回 (列表, 错误)。
+    """
+    if isinstance(raw, (list, tuple)):
+        items = [str(x).strip() for x in raw]
+    else:
+        items = [p.strip() for p in str(raw).replace("\n", ",").split(",")]
+    items = [p for p in items if p]
+    if not items:
+        return [], "包名列表是空的"
+    if len(items) > MAX_PKGS_PER_ACTION:
+        return [], ("一次最多 %d 个包（给了 %d 个）。"
+                    "分几次做，每一步都该有人能看明白。"
+                    % (MAX_PKGS_PER_ACTION, len(items)))
+    for p in items:
+        if not re.match(_PKG_RE, p):
+            return [], ("包名 %r 不合法（只允许小写字母、数字、+ . -，且以字母数字开头）。"
+                        "想指定版本或选项的话，这条通道刻意不支持 —— "
+                        "能挑版本就能挑到一个有洞的版本。" % p)
+    return items, ""
+
+
+def _dpkg_installed(pkg: str) -> bool:
+    """这个包现在是'已配置'状态吗？dpkg-query 是唯一权威口径。"""
+    rc, out = _run(["dpkg-query", "-W", "-f=${Status}", pkg])
+    return rc == 0 and out.strip() == "install ok installed"
+
+
+def _pkg_act(params: dict, phase: str, verb: str) -> dict:
+    packages, why = _split_packages(params.get("packages"))
+    if why:
+        return fail(why)
+    if verb == "install":
+        already = [p for p in packages if _dpkg_installed(p)]
+        todo = [p for p in packages if p not in already]
+    else:
+        already = [p for p in packages if not _dpkg_installed(p)]
+        todo = [p for p in packages if p not in already]
+
+    evidence = {
+        "packages": packages,
+        "already_in_state": already,
+        "to_change": todo,
+    }
+
+    if not todo:
+        return ok("这些包都已经在目标状态了：%s" % ", ".join(packages),
+                  changed=False, evidence=evidence)
+
+    if phase == "dry_run":
+        # --simulate：让 apt 自己把"会装哪些、会卸哪些、要下多少"算一遍。
+        # 这一步是免费的，而且比我们自己猜依赖树可信得多。
+        rc, out = _run(["apt-get", "-s", verb] + todo)
+        evidence["simulate_tail"] = "\n".join(out.splitlines()[-6:])
+        if rc != 0:
+            return fail("apt 预演失败（这条计划落不了地）：%s" % out[-400:], evidence)
+        tail = [ln for ln in out.splitlines()
+                if ln.startswith("Need to get") or "newly installed" in ln
+                or "to remove" in ln]
+        return ok("将 %s：%s。%s"
+                  % (verb, ", ".join(todo), " / ".join(tail) if tail else ""),
+                  evidence=evidence)
+
+    if phase == "apply":
+        env = dict(os.environ)
+        env.update({
+            "DEBIAN_FRONTEND": "noninteractive",
+            "APT_LISTCHANGES_FRONTEND": "none",
+            "LC_ALL": "C",
+        })
+        try:
+            proc = subprocess.run(
+                ["apt-get", "-y", "--no-install-recommends", verb] + todo,
+                capture_output=True, text=True, timeout=APT_TIMEOUT, env=env,
+            )
+        except subprocess.TimeoutExpired:
+            return fail("apt-get %s 超过 %ds 没结束，已放弃" % (verb, APT_TIMEOUT),
+                        evidence)
+        out = (proc.stdout + proc.stderr).strip()
+        evidence["apt_rc"] = proc.returncode
+        evidence["apt_tail"] = "\n".join(out.splitlines()[-8:])
+        if proc.returncode != 0:
+            return fail("apt-get %s 失败（rc=%d）：%s"
+                        % (verb, proc.returncode, out[-400:]), evidence)
+        return ok("已 %s：%s" % (verb, ", ".join(todo)), evidence=evidence)
+
+    # verify：不看 apt 说了什么，只问 dpkg 现在是什么状态
+    wrong = []
+    for p in packages:
+        want = (verb == "install")
+        if _dpkg_installed(p) != want:
+            wrong.append(p)
+    evidence["still_wrong"] = wrong
+    if wrong:
+        return fail("verify 失败：这些包不在目标状态：%s" % ", ".join(wrong), evidence)
+    return ok("已核实 %s 个包处于目标状态" % len(packages), changed=False,
+              evidence=evidence)
+
+
+@register("pkg.install", ("packages",), reversible=True)
+def act_pkg_install(params: dict, phase: str) -> dict:
+    """装包。标 reversible=True 是**诚实但有限度**的：`pkg.remove` 能把包拿掉，
+    但 /etc 下的配置残留不会自动消失（那要 purge），家目录里的数据也不会。
+
+    之所以仍然标 True：这条通道承诺的是"有回头路"，而不是"世界完全复原"。
+    把"卸了但留了配置"说成不可逆，会让真正不可逆的那些（user.add）失去重量。
+    诚实的做法是把边界写在明处，而不是把所有事都夸大。
+    """
+    return _pkg_act(params, phase, "install")
+
+
+@register("pkg.remove", ("packages",), reversible=True)
+def act_pkg_remove(params: dict, phase: str) -> dict:
+    """卸包。和 install 一样，卸载本身可逆（再装回来即可），配置残留归 purge 管。"""
+    return _pkg_act(params, phase, "remove")
+
+
+@register("pkg.list", ("pattern?",), reversible=True)
+def act_pkg_list(params: dict, phase: str) -> dict:
+    """只读查询：这台机器上装了什么。给 LLM 用的 —— 它要规划"装 nginx 之前
+    先看看是不是已经有 apache"，就得能问这一句。只读，三段行为一致。
+    """
+    pattern = str(params.get("pattern") or "*").strip() or "*"
+    # 允许 * ? 通配，但不允许空格/引号 —— dpkg-query 的 pattern 不该有这些
+    if any(c in pattern for c in " ;|$&`'\"\\"):
+        return fail("pattern 里有可疑字符：%r" % pattern)
+    rc, out = _run(["dpkg-query", "-W", "-f=${Package} ${Version}\\n", pattern])
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    evidence = {"pattern": pattern, "count": len(lines),
+                "sample": lines[:40]}
+    if rc != 0 and not lines:
+        # dpkg-query 在"一个都没匹配上"时返回 1，这不是错误，是"没有"
+        return ok("没有匹配 %r 的包" % pattern, changed=False, evidence=evidence)
+    return ok("匹配 %r 的包有 %d 个" % (pattern, len(lines)),
+              changed=False, evidence=evidence)
+
+
+# ------------------------------------------------------------------ action: user.*
+#
+# 这是整条通道上第一个**真正不可逆**的原语，也是第一次让
+# `--force-irreversible` 这个开关有实际用途。
+#
+# 为什么 user.add 不可逆：删掉一个用户，不会把它创建过的文件、发过的邮件、
+# 跑过的服务一起带走。`userdel -r` 会删家目录，但散落在 /var、/srv、数据库里
+# 的东西还在，UID 也可能已经被别的进程写进了配置。**把"删了用户"当成
+# "回到没建过这个用户"是错的**，所以它必须标 reversible=False，让调用者
+# 在动手前停顿一次。这个停顿就是安全机制本身。
+
+
+# 用户名：POSIX 可移植字符集，不能以 - 开头，不能是纯数字（会撞 UID）
+_USER_RE = r"^[a-z_][a-z0-9_-]{0,31}$"
+
+
+@register("user.add", ("name", "shell?", "groups?", "gecos?"), reversible=False)
+def act_user_add(params: dict, phase: str) -> dict:
+    name = str(params["name"]).strip()
+    shell = str(params.get("shell") or "/bin/bash").strip()
+    groups = str(params.get("groups") or "").strip()
+    gecos = str(params.get("gecos") or "").strip()[:64]
+
+    if not re.match(_USER_RE, name):
+        return fail("用户名 %r 不合法（小写字母/下划线开头，后接字母数字_-，最长 32）"
+                    % name)
+    if shell not in ("/bin/bash", "/bin/sh", "/bin/zsh", "/usr/bin/fish",
+                     "/usr/sbin/nologin", "/bin/false"):
+        return fail("shell %r 不在允许列表里" % shell)
+    if groups and any(c in groups for c in " ;|$&`'\""):
+        return fail("groups 里有可疑字符：%r" % groups)
+
+    try:
+        import pwd as _pwd
+        exists = _pwd.getpwnam(name) is not None
+    except KeyError:
+        exists = False
+
+    evidence = {"name": name, "shell": shell, "groups": groups,
+                "already_exists": exists}
+
+    if exists:
+        return ok("用户 %s 已经存在" % name, changed=False, evidence=evidence)
+
+    if phase == "dry_run":
+        return ok("将新建用户 %s（shell=%s%s）"
+                  % (name, shell, "，附加组=" + groups if groups else ""),
+                  evidence=evidence)
+
+    if phase == "apply":
+        argv = ["useradd", "-m", "-s", shell]
+        if gecos:
+            argv += ["-c", gecos]
+        if groups:
+            argv += ["-G", groups]
+        argv.append(name)
+        rc, out = _run(argv)
+        evidence["useradd_output"] = out
+        if rc != 0:
+            return fail("useradd 失败（rc=%d）：%s" % (rc, out), evidence)
+        return ok("已新建用户 %s" % name, evidence=evidence)
+
+    # verify
+    try:
+        import pwd as _pwd
+        ent = _pwd.getpwnam(name)
+    except KeyError:
+        return fail("verify 失败：用户 %s 不存在" % name, evidence)
+    evidence["uid"] = ent.pw_uid
+    evidence["home"] = ent.pw_dir
+    if ent.pw_shell != shell:
+        return fail("verify 失败：shell 是 %s，期望 %s" % (ent.pw_shell, shell),
+                    evidence)
+    return ok("已核实用户 %s（uid=%d，家目录 %s）" % (name, ent.pw_uid, ent.pw_dir),
+              changed=False, evidence=evidence)
 
 
 # ------------------------------------------------------------------ action: self.test
