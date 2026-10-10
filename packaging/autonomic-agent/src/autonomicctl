@@ -11,13 +11,21 @@ Two things live here:
     key the agent has an identity but no mind: it can count Actions and
     publish a world version, but it cannot think about anything.
 
+  * ``ask`` -- the part that was missing: plain words in, validated plan out.
+    The model proposes; the channel disposes. Every plan is checked, then
+    previewed end-to-end, then shown to a human, then applied step by step
+    with a verify after each step. Nothing is applied before every step has
+    passed its dry_run.
+
   autonomicctl status   the whole identity, in one screen
   autonomicctl world    the read-only world-version marker
   autonomicctl bump     record one Action through the channel (action_seq += 1)
   autonomicctl setup    configure base URL / API key / model, then probe it
   autonomicctl llm      show the current LLM config and check it really works
+  autonomicctl ask      "make it do X" -- intent in, audited actions out
   autonomicctl act      run one Action through the channel (preview -> do -> verify)
   autonomicctl actions  list what the channel is willing to do at all
+  autonomicctl backups  every file the channel overwrote, and how to put it back
   autonomicctl version
 """
 
@@ -38,8 +46,9 @@ import sys
 # 开发期直接从源码目录跑时，用 AUTONOMIC_LIB 指过去即可。
 sys.path.insert(0, os.environ.get("AUTONOMIC_LIB", "/usr/share/autonomic"))
 import autonomicconf  # noqa: E402  (必须在改完 sys.path 之后)
+import autonomicplan  # noqa: E402  (同上：自然语言 -> 受校验的动作)
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 # Action 通道的另一半在这里等着。
 ACT_SOCKET = "/run/autonomic/act.sock"
@@ -438,6 +447,273 @@ def cmd_act(args: argparse.Namespace) -> int:
     return 1
 
 
+def _catalogue_and_meta() -> tuple[list, dict]:
+    """向 actd 要一份"此刻真实存在的能力清单"。
+
+    刻意不用写死在代码里的清单：那份东西从新增第一个原语那天起就开始
+    与真身不符，而模型会照着它规划一个并不存在的 API。
+    """
+    res = _act_call("list", {}, "dry_run")
+    if not res.get("ok") or not res.get("catalogue"):
+        print("拿不到 Action 清单：%s" % res.get("detail", ""), file=sys.stderr)
+        return [], {}
+    return res.get("catalogue") or [], res
+
+
+def cmd_ask(args: argparse.Namespace) -> int:
+    """对着系统说一句人话，让它自己把话变成一串受管的动作。
+
+    顺序是这个命令的全部意义所在，打乱任何一个都不行：
+
+        1. 问模型要计划
+        2. 结构 + 语义校验（不合格就**整份**退回）
+        3. 所有步骤先 dry_run（**全部**通过之前，没有任何一步被 apply）
+        4. 人点头（--yes 才能跳过）
+        5. 逐步 apply，每一步单独 verify
+        6. 中途任何一步失败 => 立刻停，并如实报告已经改了哪几步、怎么还原
+
+    第 3 步先于任何 apply 是硬要求。允许"第 1 步成功、第 3 步被拒"这种
+    半成品结果，等于主动制造一个既不是目的地也不是出发点的机器。
+    """
+    request = " ".join(args.request).strip()
+    if not request:
+        print("要说什么就写在 ask 后面，例如：")
+        print('  autonomicctl ask "把这个主机名的解析写进 /etc/autonomic/hosts 提示"',
+              file=sys.stderr)
+        return 1
+
+    key, _src = autonomicconf.load_api_key()
+    if not key:
+        print("这台机器上的 agent 还没有思维 —— 没有配置 LLM 凭据。")
+        print()
+        print("  autonomicctl setup")
+        print()
+        print("这不是故障：身份、限额、审计流都在，它只是还不能思考。")
+        return 1
+    conf = autonomicconf.load_config()
+
+    catalogue, meta = _catalogue_and_meta()
+    if not catalogue:
+        return 1
+
+    print("请求：%s" % request)
+    print("模型：%s" % conf.get("model"))
+    print()
+
+    asked = autonomicplan.ask_plan(
+        conf.get("base_url", ""), key, conf.get("model", ""),
+        autonomicconf.get_timeout(conf), request, catalogue, meta,
+    )
+    if not asked.get("ok"):
+        print("  模型没给出可用的计划：%s" % asked.get("detail"))
+        raw = (asked.get("raw") or "").strip()
+        if raw:
+            print()
+            print("  原文（前 400 字符，完整内容在留痕文件里）：")
+            print("    " + raw[:400].replace("\n", "\n    "))
+        autonomicplan.record(request, conf.get("model", ""), [], [],
+                             raw=raw, elapsed=asked.get("elapsed", 0))
+        return 1
+    print("  模型思考 %s 秒完成。" % round(asked.get("elapsed", 0), 2))
+
+    allowlist = tuple(meta.get("write_allowlist") or ())
+    denylist = tuple(meta.get("write_denylist") or ())
+    plan_obj = asked["plan"]
+    steps, errors = autonomicplan.validate(plan_obj, catalogue, allowlist, denylist)
+    raw_plan = asked.get("raw", "")
+
+    intent = str(plan_obj.get("intent", "") or "(没说)")
+    print("意图：%s" % intent)
+
+    if errors:
+        print()
+        print("  计划被拒绝，一步都没有执行：")
+        for item in errors:
+            print("    - %s" % item)
+        note = str(plan_obj.get("note", "")).strip()
+        if note:
+            print("    模型补充：%s" % note)
+        autonomicplan.record(request, conf.get("model", ""), [], [],
+                             raw=raw_plan, elapsed=asked.get("elapsed", 0))
+        return 1
+
+    if not steps:
+        print()
+        note = str(plan_obj.get("note", "")).strip()
+        print("  模型认为这件事用现有 %d 个原语做不到。" % len(catalogue))
+        if note:
+            print("  它的说明：%s" % note)
+        print()
+        print("  这是它有权限说实话的场景 —— 缺能力就去加原语，")
+        print("  而不是给它一个 shell 让它绕过自己的边界。")
+        autonomicplan.record(request, conf.get("model", ""), [], [],
+                             raw=raw_plan, elapsed=asked.get("elapsed", 0))
+        return 0
+
+    print()
+    print("计划 %d 步：" % len(steps))
+    for pos, step in enumerate(steps, 1):
+        print("  %d. %s" % (pos, step["action"]))
+        for k, v in sorted(step["params"].items()):
+            shown = v if isinstance(v, str) else str(v)
+            if len(shown) > 60:
+                shown = shown[:57] + "..."
+            print("       %-10s %s" % (k, shown.replace("\n", "\\n")))
+        print("       理由      %s" % step["reason"])
+    print()
+
+    # ---- 全部预演，先于任何一步落地 ----
+    previews = []
+    failed_at = 0
+    for pos, step in enumerate(steps, 1):
+        res = _act_call(step["action"], step["params"], "dry_run", step["reason"])
+        print("  [%d/%d] dry_run " % (pos, len(steps)), end="")
+        _dump(step["action"], res)
+        previews.append(res)
+        if not res.get("ok"):
+            failed_at = pos
+            break
+
+    if failed_at:
+        print()
+        print("  第 %d 步预演失败，整份计划作废 —— 什么都没有改。"
+              % failed_at)
+        print("  哪怕是前 %d 步看起来可行，也不会先执行它们：那会留下一个"
+              % (failed_at - 1))
+        print("  既不完整也不原始的状态，比什么都没做糟糕得多。")
+        autonomicplan.record(request, conf.get("model", ""), steps, previews,
+                             raw=raw_plan, elapsed=asked.get("elapsed", 0))
+        return 1
+
+    if not any(p.get("changed") for p in previews):
+        print()
+        print("  系统已经就是这个样子了，无需改动。")
+        autonomicplan.record(request, conf.get("model", ""), steps, previews,
+                             raw=raw_plan, elapsed=asked.get("elapsed", 0))
+        return 0
+
+    irreversible = [str(i) for i, p in enumerate(previews, 1)
+                    if not p.get("reversible")]
+    if irreversible:
+        print()
+        print("  第 %s 步不可逆" % ", ".join(irreversible))
+        if not args.force_irreversible:
+            print("  不可逆的步骤需要再点一次头：加 --force-irreversible。")
+            return 1
+
+    if not args.yes:
+        try:
+            answer = input("\n  执行这 %d 步？输入 yes 继续：" % len(steps)
+                           ).strip().lower()
+        except EOFError:
+            answer = ""
+        if answer not in ("yes", "y"):
+            print("  取消。世界还是原来那个世界。")
+            autonomicplan.record(request, conf.get("model", ""), steps, previews,
+                                 raw=raw_plan, elapsed=asked.get("elapsed", 0))
+            return 1
+
+    # ---- 落地。每一步自己 verify，一步不成就停 ----
+    print()
+    results = []
+    applied = []
+    for pos, step in enumerate(steps, 1):
+        got = _act_call(step["action"], step["params"], "apply", step["reason"])
+        print("  [%d/%d] apply   " % (pos, len(steps)), end="")
+        _dump(step["action"], got)
+        if not got.get("ok"):
+            print()
+            print("  第 %d 步失败，后面的步骤不再执行。" % pos)
+            break
+        applied.append((pos, step, got))
+        chk = _act_call(step["action"], step["params"], "verify", step["reason"])
+        print("  [%d/%d] verify  " % (pos, len(steps)), end="")
+        _dump(step["action"], chk)
+        results.append({"pos": pos, "action": step["action"],
+                        "apply": got, "verify": chk})
+        if not chk.get("ok"):
+            print()
+            print("  apply 说成了，verify 不认 —— 以 verify 为准。")
+            break
+
+    print()
+    if not applied:
+        print("  什么都没改成。世界版本号未变。")
+        autonomicplan.record(request, conf.get("model", ""), steps, results,
+                             raw=raw_plan, elapsed=asked.get("elapsed", 0))
+        return 1
+
+    done = min(len(results), len(steps))
+    if len(results) == len(steps) and all(r["verify"].get("ok")
+                                          for r in results):
+        print("  => %d/%d 步完成并核实。世界版本号 +%d。"
+              % (len(steps), len(steps), len(steps)))
+    else:
+        print("  => 只完成 %d/%d 步。" % (done, len(steps)))
+        print()
+        print("  已经发生改动的部分如下。可逆的原语都留有备份，用")
+        print("  autonomicctl backups 可以看到全部，用")
+        print("  autonomicctl act file.restore backup=<备份路径> 还原单步：")
+        for pos, step, _res in applied:
+            backup = (_res.get("evidence") or {}).get("backup", "")
+            if backup and not backup.startswith("("):
+                print("    第 %d 步 %s -> %s" % (pos, step["action"], backup))
+
+    path = autonomicplan.record(request, conf.get("model", ""), steps, results,
+                                raw=raw_plan, elapsed=asked.get("elapsed", 0))
+    if path:
+        print()
+        print("  留痕：%s" % path)
+    return 0 if len(results) == len(steps) and all(
+        r["verify"].get("ok") for r in results) else 1
+
+
+def cmd_backups(_args: argparse.Namespace) -> int:
+    """每一次被授权的改动都在这里留着一份原稿。
+
+    这不是"备份功能"，这是**问责**：能改的系统必须能回答"改之前是什么样"，
+    并且能亲手把它放回去。
+    """
+    root = "/var/lib/autonomic/backups"
+    try:
+        names = sorted(os.listdir(root), reverse=True)
+    except OSError as exc:
+        print("读不到备份目录 %s：%s" % (root, exc), file=sys.stderr)
+        print("（还没有任何动作改动过文件，说明通道至今没写过东西。）")
+        return 1
+    if not names:
+        print("还没有任何备份 —— 通道至今没有被用来改写过文件。")
+        return 0
+    print("备份目录 %s（新的在前）：" % root)
+    print()
+    shown = 0
+    for name in names:
+        if name.endswith(".json"):
+            continue
+        full = os.path.join(root, name)
+        meta_path = full + ".json"
+        target, at, sha = "?", "?", "?"
+        try:
+            with open(meta_path, "r", encoding="utf-8") as fh:
+                meta = json.load(fh)
+            target = meta.get("path", "?")
+            at = meta.get("at", "?")
+            sha = (meta.get("sha256", "") or "")[:12]
+        except (OSError, ValueError):
+            target = "(缺 sidecar，无法自动还原)"
+        print("  %s" % name)
+        print("      原位置 %s" % target)
+        print("      时间   %s   sha256前12 %s" % (at, sha))
+        if target.startswith("/"):
+            print("      还原   autonomicctl act file.restore backup=%s" % full)
+        print()
+        shown += 1
+        if shown >= 20:
+            print("  ...（只显示最近 20 条，完整列表看目录本身）")
+            break
+    return 0
+
+
 def cmd_version(_args: argparse.Namespace) -> int:
     print("autonomicctl %s" % VERSION)
     return 0
@@ -491,6 +767,21 @@ def main() -> int:
         help="required in addition to --yes for irreversible actions",
     )
     act.set_defaults(fn=cmd_act)
+
+    ask = sub.add_parser(
+        "ask", help="say what you want in plain words; get a validated plan",
+    )
+    ask.add_argument("request", nargs="+", help="what you want done")
+    ask.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
+    ask.add_argument(
+        "--force-irreversible", action="store_true",
+        help="in addition to --yes, if any step cannot be undone",
+    )
+    ask.set_defaults(fn=cmd_ask)
+
+    sub.add_parser(
+        "backups", help="every file the channel overwrote, and how to put it back"
+    ).set_defaults(fn=cmd_backups)
 
     sub.add_parser("version", help="print version").set_defaults(fn=cmd_version)
     args = ap.parse_args()

@@ -211,6 +211,11 @@ cp "$OUT/etc/issue" "$OUT/etc/issue.net"
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 install -m 0755 "$ROOT_DIR/build/autonomic-install" "$OUT/usr/sbin/autonomic-install"
 
+# 假的 OpenAI-compatible 端点（验收用）：让"AI 闭环"这件事可以在没有任何
+# 真 API key 的情况下被完整、反复地验证。它打包进 live 环境，因为它服务
+# 的对象是验收脚本，不是终端用户 —— 装机后的系统里需要真的连一个真的模型。
+install -m 0755 "$ROOT_DIR/scripts/mock-llm.py" "$OUT/usr/local/share/mock-llm.py"
+
 # SSH 公钥（验收/运维用）：AOS 台架的公钥预置进 rootfs，否则每次重建都得手动加
 KEY_PUB="/mnt/d/Code/AOS/vm/keys/id_ed25519.pub"
 if [ -f "$KEY_PUB" ]; then

@@ -27,6 +27,11 @@ jobs:
       - name: Build the .deb
         run: ./build/build.sh
 
+      # 在编译产物之前先跑纯逻辑自检：它 1 秒内跑完，却能挡住
+      # "计划校验放松了"这类最贵的回归 —— 那是整条 AI 通道的入口过滤器。
+      - name: Planner self-check (parse + validation)
+        run: python3 scripts/test-plan.py
+
       - name: Reproducibility check -- build twice, must be byte-identical
         run: |
           a=$(sha256sum dist/*.deb | awk '{print $1}')

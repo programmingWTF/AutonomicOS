@@ -85,5 +85,48 @@ $SSH 'echo "--- 两个守护进程（思考者 + 执行者）---";
       echo "--- 凭据落地权限（credentials.env 必须是 640 root:autonomic）---";
       stat -c "%a %U:%G %n" /etc/autonomic/credentials.env /etc/autonomic/agent.conf 2>&1' 2>&1
 
+step "8. 验收：AI 闭环 —— 说人话 -> 校验 -> 预演 -> 落地 -> 回滚"
+# 这一节用仓库自带的假 LLM 端点（scripts/mock-llm.py）在**虚机里**跑完整条
+# AI 路径。为什么要用假的：这条链路最贵的东西不是 LLM 的智力，而是
+# "你确实按纪律做了"—— 不许部分执行、预演先于落地、每步单独核实、
+# 越界整份退回。这些性质跟对面是真 GPT 还是假服务毫无关系，而用假的
+# 可以重复上千遍、每次返回的字节一模一样。
+$SSH 'pkill -f mock-llm.py 2>/dev/null; sleep 1;
+      python3 /usr/local/share/mock-llm.py --port 8099 >/tmp/mockllm.log 2>&1 &
+      sleep 2;
+      autonomicctl setup --base-url http://127.0.0.1:8099/v1 --api-key mock-key \
+          --model mock-1 --non-interactive 2>&1 | tail -3' 2>&1
+
+echo
+echo "--- 8a. 合法计划：两步，必须全部预演通过后才落地 ---"
+$SSH 'autonomicctl ask "mode=good 把通道自检再做一遍" --yes 2>&1' 2>&1
+
+echo
+echo "--- 8b. 越界计划：写到 /etc/ssh/，必须整份退回且一步未执行 ---"
+$SSH 'autonomicctl ask "mode=illegal 帮我改一下 sshd 配置" --yes 2>&1 | tail -8' 2>&1
+
+echo
+echo "--- 8c. 不合格计划：未登记 action + 缺 reason，必须整份退回 ---"
+$SSH 'autonomicctl ask "mode=badstep 删掉根目录" --yes 2>&1 | tail -6' 2>&1
+
+echo
+echo "--- 8d. 回滚：先改，再用 file.restore 收回去 ---"
+$SSH 'printf "%s\n" "before = 原始内容" > /etc/autonomic/rollback-demo.conf
+      autonomicctl act file.write path=/etc/autonomic/rollback-demo.conf \
+          content="after = 被 AI 改过" --yes --reason="回滚演示" 2>&1 | tail -4
+      echo "  改后: $(cat /etc/autonomic/rollback-demo.conf)"
+      BK=$(ls -t /var/lib/autonomic/backups/*rollback-demo.conf 2>/dev/null | head -1)
+      echo "  备份: $BK"
+      autonomicctl act file.restore backup="$BK" --yes --reason="回滚演示" 2>&1 | tail -4
+      echo "  还原后: $(cat /etc/autonomic/rollback-demo.conf)"' 2>&1
+
+echo
+echo "--- 8e. 每次改动都留痕，且日志可读 ---"
+$SSH 'ls -1 /var/lib/autonomic/plans/ 2>/dev/null | tail -3;
+      echo "--- 审计文件片段 ---";
+      tail -c 600 "$(ls -t /var/lib/autonomic/plans/*.json | head -1)"' 2>&1
+
+$SSH 'pkill -f mock-llm.py 2>/dev/null; true' 2>&1
+
 echo
 step "完成。虚拟机 $VM 保留（可随时开机复查）。"

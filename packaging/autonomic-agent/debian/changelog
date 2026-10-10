@@ -1,3 +1,33 @@
+autonomic-agent (0.3.0-1) unstable; urgency=medium
+
+  * Planned action: plain words in, audited actions out. This is the missing
+    piece between the LLM and the Action channel -- until now the channel
+    existed but nothing translated intent into calls it accepts.
+    - `autonomicctl ask "..."`: the model proposes, the channel disposes
+    - the tool list handed to the model is fetched live from autonomic-actd,
+      never hardcoded in the planner, so the two cannot drift apart
+    - every plan must pass structural checks (valid JSON, known action, known
+      parameters, path inside the write allowlist) and every step must carry
+      a reason; an unexplained write is refused
+    - all steps are dry_run'd before ANY step is applied, because a
+      half-applied plan leaves a machine that is neither where it was nor
+      where you asked it to go
+    - each step is verified immediately after apply; on failure everything
+      stops and the already-applied steps are reported with their backups
+  * Reversibility becomes a fact instead of a claim: backups now carry a
+    sidecar recording where the file came from (the filename alone is
+    ambiguous, since "_" is legal in Linux paths), and the new `file.restore`
+    primitive puts them back. A reversible flag with no way back is a wish,
+    not a capability.
+  * `autonomicctl backups` lists every file the channel overwrote and prints
+    the exact command to restore each one.
+  * Backup filenames now carry microseconds: within the same second a second
+    write silently overwrote the only copy of the previous contents.
+  * scripts/mock-llm.py ships a fake OpenAI-compatible endpoint so the whole
+    AI path can be verified without a real API key, and repeatedly.
+
+ -- Autonomic OS <autonomic@localhost>  Sat, 11 Oct 2026 02:00:00 +0800
+
 autonomic-agent (0.2.0-1) unstable; urgency=medium
 
   * Power switch. The agent can now hold credentials for an OpenAI-compatible

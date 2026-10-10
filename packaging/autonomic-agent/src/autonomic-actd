@@ -40,7 +40,7 @@ import time
 sys.path.insert(0, os.environ.get("AUTONOMIC_LIB", "/usr/share/autonomic"))
 import autonomicact  # noqa: E402
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 SOCKET_PATH = "/run/autonomic/act.sock"
 AGENT_USER = "autonomic"

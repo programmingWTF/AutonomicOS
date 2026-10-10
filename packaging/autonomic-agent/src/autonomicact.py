@@ -40,12 +40,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import posixpath
 import shutil
 import socket
 import subprocess
 import time
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 # ------------------------------------------------------------------ 写权限边界
 # 白名单，不是黑名单。
@@ -172,7 +173,8 @@ def catalogue() -> list:
 def _check_write_path(path: str) -> tuple[bool, str]:
     if not path.startswith("/"):
         return False, "路径必须是绝对路径：%r" % path
-    real = os.path.normpath(path)
+    # posixpath，不是 os.path：这里判断的是目标系统里的路径语义。
+    real = posixpath.normpath(path)
     for bad in WRITE_DENYLIST:
         if real == bad or real.startswith(bad):
             return False, "拒绝：%s 在系统保护名单上" % real
@@ -198,15 +200,40 @@ def _read(path: str) -> str | None:
 
 
 def _backup(path: str) -> str:
-    """apply 之前把原文件存一份。回滚的凭据就指着它。"""
+    """apply 之前把原文件存一份。回滚的凭据就指着它。
+
+    备份名带微秒：原来只到秒，同一秒内对同一个文件连续 apply 两次，
+    第二次会静默覆盖第一次的备份 —— 也就是把"上一版"弄丢了。回滚从来
+    都是为了回到上一个状态，备份之间互相覆盖等于没备份。
+
+    除了内容副本，还写一个同名 .json 的 sidecar 记录它**原本属于哪里**。
+    这不是冗余：备份名里的路径分隔符是 `_`，而 Linux 路径本身允许 `_`，
+    所以 `/etc/autonomic/my_conf` 编码成 `etc_autonomic_my_conf` 之后，
+    谁也分不清那是三个目录还是两个目录加一个下划线。
+    **猜一个文件从哪来，正是"回滚"变成"覆盖"的方式。**
+    机器要还原，就必须读 sidecar；没有 sidecar 就拒绝还原。
+    """
     if not os.path.exists(path):
         return ""
     os.makedirs(BACKUP_DIR, exist_ok=True)
-    stamp = time.strftime("%Y%m%dT%H%M%S")
+    stamp = time.strftime("%Y%m%dT%H%M%S%f")
     target = os.path.join(
         BACKUP_DIR, "%s_%s" % (stamp, path.strip("/").replace("/", "_"))
     )
     shutil.copy2(path, target)
+    try:
+        meta = {
+            "path": path,
+            "sha256": _sha(_read(path) or ""),
+            "mode": oct(os.stat(path).st_mode & 0o7777),
+            "at": stamp,
+        }
+        with open(target + ".json", "w", encoding="utf-8") as fh:
+            json.dump(meta, fh, sort_keys=True)
+    except OSError:
+        # sidecar 写不出来不该让这次变更失败 —— 代价是这个备份将来不能被
+        # file.restore 自动还原（它仍旧可以被人手动 cp 回去）。
+        pass
     return target
 
 
@@ -278,6 +305,94 @@ def act_file_write(params: dict, phase: str) -> dict:
     if _sha(now) != after_sha:
         return fail("verify 失败：%s 内容与目标不符" % resolved, evidence)
     return ok("已核实 %s 内容正确" % resolved, changed=False, evidence=evidence)
+
+
+# ------------------------------------------------------------------ action: file.restore
+#
+# 这个 action 存在的理由只有一句：**reversible=True 之前只是一个声明。**
+#
+# 一个 action 说自己可逆，却没有任何人知道怎么把它转回去，那它说的是
+# 一句愿望。file.write 每次 apply 都存了备份 + sidecar，但没有机制把备份
+# 放回原位就等于：给你降落伞，但不给你拉环。
+#
+# 有了它，"AI 可以改一切" 才算配得上 "AI 也能收回它"。力气越大，越需要
+# 能往回走的那条路，否则一次误会就是永久性的。
+
+
+@register("file.restore", ("backup",), reversible=True)
+def act_file_restore(params: dict, phase: str) -> dict:
+    raw_backup = str(params["backup"]).strip()
+    backup = posixpath.normpath(raw_backup)
+
+    # 两端都要卡死：源必须在备份目录里，目标必须在可写前缀里。
+    # 只卡一头的话，攻击者可以把"备份"指向任意文件再让它还原到别处。
+    if not backup.startswith(BACKUP_DIR.rstrip("/") + "/"):
+        return fail(
+            "拒绝：备份文件必须在 %s/ 之下（拿到的是 %r）" % (BACKUP_DIR, raw_backup),
+            {"backup": raw_backup},
+        )
+    if not os.path.isfile(backup):
+        return fail("备份不存在：%s" % backup, {"backup": backup})
+
+    meta_path = backup + ".json"
+    try:
+        with open(meta_path, "r", encoding="utf-8") as fh:
+            meta = json.load(fh)
+    except OSError:
+        return fail(
+            "备份缺少 sidecar（%s），无法确定它原本属于哪里。\n"
+            "刻意不去猜文件名 —— 猜错一次就是把别人的文件覆盖掉。"
+            % meta_path,
+            {"backup": backup},
+        )
+    except ValueError:
+        return fail("sidecar 不是合法 JSON：%s" % meta_path, {"backup": backup})
+
+    target_raw = str(meta.get("path", ""))
+    want_sha = str(meta.get("sha256", ""))
+    if not target_raw or not want_sha:
+        return fail("sidecar 缺少 path/sha256，拒绝还原", {"backup": backup})
+
+    allowed, resolved = _check_write_path(target_raw)
+    if not allowed:
+        return fail(resolved, {"backup": backup})
+
+    before = _read(resolved)
+    evidence = {
+        "restore_to": resolved,
+        "backup": backup,
+        "sha256_before": _sha(before) if before is not None else "(不存在)",
+        "sha256_target": want_sha,
+    }
+
+    if before is not None and _sha(before) == want_sha:
+        return ok("%s 已经就是备份里的样子，无需还原" % resolved,
+                  changed=False, evidence=evidence)
+
+    if phase == "dry_run":
+        return ok(
+            "将把 %s 还原到备份 %s 的内容" % (resolved, os.path.basename(backup)),
+            evidence=evidence,
+        )
+
+    if phase == "apply":
+        # 还原本身也要先备份现状：回滚不是单行道，回滚错了还得能再回滚。
+        evidence["backup_of_current"] = _backup(resolved) or "(原本不存在)"
+        tmp = resolved + ".autonomic.tmp"
+        shutil.copyfile(backup, tmp)
+        try:
+            os.chmod(tmp, int(str(meta.get("mode", "0644")), 8))
+        except (ValueError, OSError):
+            os.chmod(tmp, 0o644)
+        os.replace(tmp, resolved)
+        return ok("已还原 %s" % resolved, evidence=evidence)
+
+    now = _read(resolved)
+    if now is None:
+        return fail("verify 失败：%s 不存在" % resolved, evidence)
+    if _sha(now) != want_sha:
+        return fail("verify 失败：%s 内容与备份不符" % resolved, evidence)
+    return ok("已核实 %s 与备份一致" % resolved, changed=False, evidence=evidence)
 
 
 # ------------------------------------------------------------------ action: service.set

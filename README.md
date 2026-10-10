@@ -42,11 +42,12 @@
 | | 状态 | 一句话 |
 |---|---|---|
 | **M1** 身份 | ✅ | agent 是 uid/GID/unit/cgroup/日志命名空间齐全的**系统主体**，不是一个 Python 进程 |
-| **M2** 启动 | ✅ | 238 MB ISO 能从 UEFI 起来（已装机到硬盘实测） |
+| **M2** 启动 | ✅ | 250 MB ISO 能从 UEFI 起来（已装机到硬盘实测） |
 | **M3** 装机 | ✅ | `autonomic-install /dev/sda` 一条命令落盘，拔盘重启照常进系统 |
 | **M4** 通电 | ✅ | LLM 凭据 + `autonomicctl setup`，密钥走 systemd LoadCredential，不落地到环境变量 |
-| **M5** 通道 | 🚧 | **Action 通道**：dry_run / apply / verify 三段 + 可逆性声明 |
-| **M6** 向导 | ⬜ | 装机 TUI（whiptail），让第二个人也能装上 |
+| **M5** 通道 | ✅ | **Action 通道**：dry_run / apply / verify 三段 + 可逆性声明 + `file.restore` |
+| **M6** 向导 | ✅ | 装机 TUI（whiptail）：选盘 → 二次手打设备名 → 主机名 → 用户 → LLM（可跳过） |
+| **M7** 闭环 | ✅ | `autonomicctl ask "…"`：说人话进，受校验的动作出；模型提议，通道裁决 |
 
 每次 push 由 CI 编两遍比对 sha256 发布；apt 仓库是静态站点，丢任何 HTTPS 托管上都能用。
 
@@ -116,6 +117,58 @@ Action: file.write
 
 以及每个 action 必须声明的性质：**可逆，还是不可逆**。不可逆的事要额外一个显式开关才准做。
 
+而且"可逆"不是口号 —— 每次覆盖文件都留一份原稿和一个记录**它原本属于哪里**的
+sidecar，`autonomicctl backups` 列出来，`file.restore` 把它放回去。
+一个声明自己可逆、却没人知道怎么把它转回去的 action，说的是一句愿望。
+
+### 说人话，让系统自己变成一个受管的计划
+
+通道就绪之后，缺的是最后一段：**把一句话翻译成一串通道能接受的动作**。
+
+```bash
+$ sudo autonomicctl ask "把通道自检再做一遍"
+
+请求：把通道自检再做一遍
+模型：gpt-4o-mini
+
+  模型思考 1.7 秒完成。
+意图：在 Autonomic 的配置目录里留下一张身份卡，并确认通道仍然通畅
+计划 2 步：
+  1. file.write
+       path       /etc/autonomic/identity-card.conf
+       content    # 这张卡是 AI 通过 Action 通道写下来的\nowner = autonomic\n...
+       理由        给这台机器留一份可核验的来源说明
+  2. self.test
+       理由        写完之后要确认通道本身还是通的
+
+  [1/2] dry_run OK     将新建 /etc/autonomic/identity-card.conf（0 行 -> 3 行）
+  [2/2] dry_run OK     将写入 /run/autonomic/channel.probe
+
+  执行这 2 步？输入 yes 继续：yes
+
+  [1/2] apply   OK     已写入 /etc/autonomic/identity-card.conf
+  [1/2] verify  OK     已核实 /etc/autonomic/identity-card.conf 内容正确
+  [2/2] apply   OK     已写入 /run/autonomic/channel.probe
+  [2/2] verify  OK     已核实 /run/autonomic/channel.probe 内容正确
+
+  => 2/2 步完成并核实。世界版本号 +2。
+  留痕：/var/lib/autonomic/plans/plan-20261011T014000.json
+```
+
+规矩写在这里，因为它们是这个功能的全部分量所在：
+
+- **模型提议，通道裁决。** 模型碰不到执行入口，也决定不了 phase。它输出的东西要连过
+  三道：结构校验（是不是合法 JSON、action 认不认识、参数在不在 schema 里、路径在不在
+  可写前缀里）→ 语义校验 → **全计划预演**。
+- **每一步必须有 reason。** 没有理由的写操作一律拒绝。理由不是仪式感：三个月后翻
+  审计日志，唯一能回答"它当时为什么动这个文件"的就是它。
+- **预演先于任何一次落地。** 第 1 步成功、第 3 步被拒这种半成品结果，比整个拒绝糟糕
+  得多 —— 它留下一个既不是目的地也不是出发点的世界。
+- **能力清单是从 actd 实时取的，不在代码里抄一份。** 抄的那份从加入第一个新原语那天
+  就开始说谎，而模型会照着谎话规划一个不存在的 API。
+- **没有 shell 逃生口。** 缺能力就承认缺，加原语。一旦开了"内置动作不够就用 shell"
+  的口子，上面全部退化成装饰。
+
 ### 为什么这套东西不是花架子
 
 每次 apply 成功都会让 `action_seq` +1，而这个计数器投影出 `/run/autonomic/world`。
@@ -124,12 +177,26 @@ Action: file.write
 于是：**绕过通道的改动不计数** —— 差异本身就是检测信号。有人偷偷改了世界标记而不走
 Action 通道，agent 下一个 tick 就会 WARN 并纠正回来。这是整套设计里最值钱的一句。
 
+### 不花一分钱地验证这一切
+
+```bash
+python3 scripts/test-plan.py          # 21 项：解析与校验逻辑（纯函数，跑得飞快）
+python3 scripts/mock-llm.py &         # 一个假的 OpenAI-compatible 端点
+sudo autonomicctl setup --base-url http://127.0.0.1:8099/v1 \
+    --api-key mock --model mock-1 --non-interactive
+sudo autonomicctl ask "把通道自检再做一遍"
+```
+
+这条链路最贵的东西不是 LLM 的智力，而是**你确实按纪律做了** —— 不许部分执行、
+预演先于落地、每步单独核实、越界整份退回。这些性质跟对面是真 GPT 还是假服务毫无
+关系，所以 CI 和任何一个刚 clone 的人都该能把它验上千遍。
+
 <br>
 
 ## 构建
 
 ```bash
-./build/build.sh        # -> dist/autonomic-agent_0.2.0-1_all.deb
+./build/build.sh        # -> dist/autonomic-agent_0.3.0-1_all.deb
 ./build/build-rootfs.sh # -> 643 MB rootfs（签证我们自己的包 + 改默认值）
 ./build/make-iso.sh     # -> dist/autonomic-os-0.1-amd64.iso
 ```
