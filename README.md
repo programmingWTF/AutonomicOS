@@ -73,10 +73,35 @@ sudo autonomicctl status
 ### 方式二：整个系统
 
 ```bash
-./build/build-rootfs.sh && ./build/make-iso.sh     # -> dist/autonomic-os-0.1-amd64.iso
+./scripts/rebuild-iso.sh    # -> dist/autonomic-os-0.1-amd64.iso
 ```
 
+⚠️ **不要单独跑 `build-rootfs.sh`。** 它安装 `autonomic-agent` 的包源不是
+`dist/*.deb`，而是签名的 apt 仓库 `repo/out` —— 少了 `repo/make-repo.sh` 这一步，
+装进 ISO 的就是**上一次**发布进仓库的版本。这个失败模式什么都不报：
+构建绿灯、体积正常、能开机，只是你新写的功能不在里面。
+`rebuild-iso.sh` 把四步串成一条链，不给人漏掉中间那一步的机会。
+
 ISO 从 UEFI 起来后：`autonomic-install /dev/sda`，关机拔盘，重启就是从硬盘进 Autonomic OS。
+
+### 为什么 ISO 只有 250 MB，而 Ubuntu 是 3 GB
+
+因为"完整 Linux 生态"说的是**能装什么**，不是**预装了什么**。
+
+Ubuntu 那个 3 GB 里绝大部分是给别人用的默认装修：GNOME、LibreOffice、Firefox、
+几百个固件包和输入法。这些在 Ubuntu 自己的仓库里一分不少，而 Autonomic OS
+**从同一个上游仓库取包** —— `apt install nginx` 拿到的是同一个 nginx。
+
+所以这里预装的只是"能装、能启动、能联网、能继续装更多东西"的最小闭包：
+
+```
+内核 · grub-efi · initramfs-tools · systemd · dbus · udev
+openssh-server · systemd-networkd/resolved · sudo
+python3 · apt · parted · dosfstools · rsync · whiptail · nano
+```
+
+加起来不到 600 MB。需要桌面的时候，`autonomicctl ask "装一个桌面环境"` 或
+直接 `apt install` 都行 —— 只是没把它塞进安装介质而已。
 
 <br>
 
@@ -225,9 +250,16 @@ sudo autonomicctl ask "把通道自检再做一遍"
 ## 构建
 
 ```bash
-./build/build.sh        # -> dist/autonomic-agent_0.3.0-1_all.deb
-./build/build-rootfs.sh # -> 643 MB rootfs（签证我们自己的包 + 改默认值）
-./build/make-iso.sh     # -> dist/autonomic-os-0.1-amd64.iso
+./scripts/rebuild-iso.sh    # 四步链，别跳步（原因见上"方式二"）
+```
+
+拆开是这四步，顺序不能换：
+
+```bash
+./build/build.sh            # -> dist/autonomic-agent_0.4.0-1_all.deb
+./repo/make-repo.sh         # -> repo/out（签名 apt 仓库；rootfs 从这里取包）
+./build/build-rootfs.sh     # -> rootfs（装我们自己的包 + 写默认值）
+./build/make-iso.sh         # -> dist/autonomic-os-0.1-amd64.iso
 ```
 
 可复现：固定 `SOURCE_DATE_EPOCH`、构建前修权限位、锁定基础环境。
