@@ -80,8 +80,10 @@ cp "$INITRD"  "$ISO_DIR/live/initrd.img"
 
 # ---------------------------------------------------------------- 3. squashfs 根
 rm -f "$ISO_DIR/live/filesystem.squashfs"
+# 刻意**不排除 /boot**：autonomic-install 落盘时靠 rsync 整个 / 复制系统，
+# /boot 不在 squashfs 里，装出来的硬盘就没有内核。
 mksquashfs "$ROOTFS" "$ISO_DIR/live/filesystem.squashfs" \
-    -comp xz -Xbcj x86 -b 1M -noappend -e boot -processors "$(nproc)" \
+    -comp xz -Xbcj x86 -b 1M -noappend -processors "$(nproc)" \
     | tail -2
 echo "make-iso.sh: squashfs $(du -h "$ISO_DIR/live/filesystem.squashfs" | cut -f1)"
 

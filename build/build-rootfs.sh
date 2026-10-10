@@ -85,6 +85,7 @@ mmdebstrap \
         adduser
         parted
         dosfstools
+        rsync
     " \
     "$SUITE" "$OUT" \
     "deb $MIRROR $SUITE main restricted universe multiverse" \
@@ -186,6 +187,27 @@ chroot "$OUT" sh -c '
 # 开机第一眼还是 "Ubuntu 24.04 LTS"，默认值就白设了）
 printf '%s\n' 'Autonomic OS 0.1 (research prototype)' ' \l' '' > "$OUT/etc/issue"
 cp "$OUT/etc/issue" "$OUT/etc/issue.net"
+
+# 落盘安装器（M3）：live 系统里跑一条命令就能装进硬盘
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+install -m 0755 "$ROOT_DIR/build/autonomic-install" "$OUT/usr/sbin/autonomic-install"
+
+# SSH 公钥（验收/运维用）：AOS 台架的公钥预置进 rootfs，否则每次重建都得手动加
+KEY_PUB="/mnt/d/Code/AOS/vm/keys/id_ed25519.pub"
+if [ -f "$KEY_PUB" ]; then
+    PUB=$(cat "$KEY_PUB")
+    for u in root guiyu; do
+        if [ "$u" = root ]; then d="$OUT/root"; else d="$OUT/home/$u"; fi
+        mkdir -p "$d/.ssh"
+        printf '%s\n' "$PUB" > "$d/.ssh/authorized_keys"
+        chmod 700 "$d/.ssh"
+        chmod 600 "$d/.ssh/authorized_keys"
+        if [ "$u" = guiyu ]; then
+            chown -R 1000:1000 "$d/.ssh"
+        fi
+    done
+    echo "build-rootfs.sh: ssh pubkey installed for root + guiyu"
+fi
 
 # release 标识 —— 让人一眼知道这是哪个系统
 cat > "$OUT/etc/os-release" <<EOF

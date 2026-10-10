@@ -1,0 +1,103 @@
+#!/bin/bash
+# autonomic-install -- 把 live 系统落到硬盘。
+#
+#   sudo autonomic-install /dev/sdX
+#
+# 这不是 debian-installer 那种交互式安装器，它是 CHARTER 里"最小安装器"的实现：
+# 分区 -> 复制当前 live 系统 -> 装 GRUB -> 完事。因为要装的东西就是正在跑的
+# 这套系统，所以没有任何"选择要装什么"的问题 —— 默认值就是全部。
+#
+# UEFI 机器用 --removable 安装（写 /EFI/BOOT/BOOTX64.EFI），不碰 NVRAM，
+# 这样它像 U 盘一样"插上就能启"，也避免污染宿主的启动项。
+
+set -eu
+
+DISK="${1:-}"
+[ -b "$DISK" ] || { echo "usage: autonomic-install /dev/sdX   (整块盘，不是分区)" >&2; exit 1; }
+[ "$(id -u)" = 0 ] || { echo "needs root" >&2; exit 1; }
+
+echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+echo "!! 这会把 $DISK 整盘抹掉并安装 Autonomic OS"
+echo "!! 10 秒后开始，Ctrl+C 取消"
+echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+sleep 10
+
+MNT=/mnt/autonomic-install
+umount -R "$MNT" 2>/dev/null || true
+
+# ---------------------------------------------------------------- 1. 分区
+parted -s "$DISK" mklabel gpt
+parted -s "$DISK" mkpart ESP fat32 1MiB 513MiB
+parted -s "$DISK" set 1 esp on
+parted -s "$DISK" mkpart root ext4 513MiB 100%
+partprobe "$DISK"
+sleep 2
+
+# 分区节点命名：nvme0n1 这类以数字结尾的设备要加 p，/dev/sda 这种不要
+case "$DISK" in
+    *[0-9]) ESP="${DISK}p1"; ROOTP="${DISK}p2" ;;
+    *)      ESP="${DISK}1";  ROOTP="${DISK}2" ;;
+esac
+
+# partprobe 之后节点不一定立刻出现，等它
+for _ in $(seq 1 15); do
+    [ -b "$ESP" ] && [ -b "$ROOTP" ] && break
+    partprobe "$DISK" 2>/dev/null || true
+    sleep 1
+done
+[ -b "$ESP" ] && [ -b "$ROOTP" ] || {
+    echo "autonomic-install: partition nodes did not appear ($ESP / $ROOTP)" >&2
+    exit 1
+}
+
+mkfs.fat -F32 "$ESP"
+mkfs.ext4 -F "$ROOTP"
+
+# ---------------------------------------------------------------- 2. 复制系统
+mkdir -p "$MNT"
+mount "$ROOTP" "$MNT"
+mkdir -p "$MNT/boot/efi"
+mount "$ESP" "$MNT/boot/efi"
+
+echo "autonomic-install: copying the live system..."
+rsync -aHAX \
+    --exclude=/proc --exclude=/sys --exclude=/dev --exclude=/run \
+    --exclude=/tmp --exclude=/media --exclude=/mnt \
+    --exclude="$MNT" \
+    / "$MNT/"
+
+# rsync 排除掉的目录要补回来（空目录 + 正确权限）
+for d in proc sys dev run tmp media mnt; do
+    mkdir -p "$MNT/$d"
+done
+chmod 1777 "$MNT/tmp"
+
+# ---------------------------------------------------------------- 3. fstab（按 UUID，换机器也不怕）
+ESP_UUID=$(blkid -s UUID -o value "$ESP")
+ROOT_UUID=$(blkid -s UUID -o value "$ROOTP")
+cat > "$MNT/etc/fstab" <<EOF
+UUID=$ROOT_UUID / ext4 defaults 0 1
+UUID=$ESP_UUID /boot/efi vfat umask=0077 0 2
+EOF
+
+# ---------------------------------------------------------------- 4. GRUB
+mount --bind /dev "$MNT/dev"
+mount -t proc proc "$MNT/proc"
+mount -t sysfs sys "$MNT/sys"
+
+echo "autonomic-install: installing GRUB..."
+chroot "$MNT" /bin/bash -c '
+    export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    export DEBIAN_FRONTEND=noninteractive
+    grub-install --target=x86_64-efi --efi-directory=/boot/efi \
+        --bootloader-id=AutonomicOS --removable --no-nvram
+    update-grub
+'
+
+umount -R "$MNT/dev" "$MNT/proc" "$MNT/sys" 2>/dev/null || true
+umount -R "$MNT" 2>/dev/null || true
+
+echo
+echo "autonomic-install: 完成。"
+echo "  重启并移除安装介质，机器就会从硬盘启动 Autonomic OS。"
+echo "  （prototype 默认口令 guiyu/autonomic —— 进去第一件事就是改掉）"
