@@ -38,6 +38,22 @@ if [ -n "$missing" ]; then
     exit 1
 fi
 
+# ---- 行尾自检：装进包里的东西必须是 LF，否则 kernel 读不懂 shebang ----
+# 这不是理论问题。源码在 Windows 侧被文本模式写回成 CRLF 之后，Linux 内核
+# 读出来的解释器是 "/usr/bin/python3\r"，于是**每一个**入口都是
+#
+#     /usr/bin/autonomicctl: cannot execute: required file not found
+#
+# 文件在、权限对、可执行位有 —— 就是起不来。而且它**不会让构建失败**，
+# 只在装机之后的硬盘系统上炸，排查起来像灵异事件。
+# 所以这里在构建时就把它拦下：便宜、确定、不会漏。
+if grep -rIl $'\r' "$SRC/src" "$SRC/debian" >/dev/null 2>&1; then
+    echo "build.sh: 下面的文件带 CR（CRLF 行尾），会被打进 deb：" >&2
+    grep -rIl $'\r' "$SRC/src" "$SRC/debian" >&2
+    echo "build.sh: 修法：把行尾转回 LF，并确认 .gitattributes 里的 eol=lf 生效。" >&2
+    exit 1
+fi
+
 echo "build.sh: SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH"
 echo "build.sh: source tree   $SRC"
 
