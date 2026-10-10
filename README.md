@@ -31,8 +31,11 @@
 **状态：✅ 已验收（2026-10-09，17/17 通过，见下）**
 
 ```bash
-# 目标机（原厂 Ubuntu 24.04）上只需要一行：
-echo "deb [signed-by=/etc/apt/keyrings/autonomic-archive-keyring.gpg] <REPO-URL> stable main" \
+# 公网 apt 源（GitHub Pages 托管，CI 自动发布）：
+sudo mkdir -p /etc/apt/keyrings
+curl -fsSL https://programmingwtf.github.io/AutonomicOS/autonomic-archive-keyring.gpg \
+  | sudo tee /etc/apt/keyrings/autonomic-archive-keyring.gpg >/dev/null
+echo "deb [signed-by=/etc/apt/keyrings/autonomic-archive-keyring.gpg] https://programmingwtf.github.io/AutonomicOS stable main" \
   | sudo tee /etc/apt/sources.list.d/autonomic.list
 
 sudo apt update && sudo apt install autonomic-agent
