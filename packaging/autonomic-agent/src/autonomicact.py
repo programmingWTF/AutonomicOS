@@ -623,13 +623,27 @@ def _pkg_act(params: dict, phase: str, verb: str) -> dict:
         return ok("这些包都已经在目标状态了：%s" % ", ".join(packages),
                   changed=False, evidence=evidence)
 
+    # dry_run 和 apply **必须用同一套参数**。如果预演用的是 A、落地用的是 B，
+    # 那"预演"就没有在预演真正要发生的那件事 —— 它会变成一个安心仪式。
+    argv = ["apt-get", "-y", verb] + todo
+
     if phase == "dry_run":
-        # --simulate：让 apt 自己把"会装哪些、会卸哪些、要下多少"算一遍。
-        # 这一步是免费的，而且比我们自己猜依赖树可信得多。
+        # -s（simulate）：让 apt 自己把"会装哪些、会卸哪些、要下多少"算一遍。
+        # 免费，而且比我们自己猜依赖树可信得多。
+        # 注意这里刻意**不加 --no-install-recommends**：用户说"装 nginx"
+        # 要的是能用的 nginx，不是缺了一半配置的精简版。预演会把连带装进来的
+        # 数量算出来给人看，要不要接受是人的决定，不是这条通道替人做的决定。
         rc, out = _run(["apt-get", "-s", verb] + todo)
         evidence["simulate_tail"] = "\n".join(out.splitlines()[-6:])
         if rc != 0:
             return fail("apt 预演失败（这条计划落不了地）：%s" % out[-400:], evidence)
+        # 从 -s 的输出里数出"将会新装 N 个包"，这是人点头之前最该看到的一个数
+        extra = 0
+        for ln in out.splitlines():
+            m = re.search(r"(\d+) newly installed", ln)
+            if m:
+                extra = int(m.group(1))
+        evidence["newly_installed"] = extra
         tail = [ln for ln in out.splitlines()
                 if ln.startswith("Need to get") or "newly installed" in ln
                 or "to remove" in ln]
@@ -646,8 +660,7 @@ def _pkg_act(params: dict, phase: str, verb: str) -> dict:
         })
         try:
             proc = subprocess.run(
-                ["apt-get", "-y", "--no-install-recommends", verb] + todo,
-                capture_output=True, text=True, timeout=APT_TIMEOUT, env=env,
+                argv, capture_output=True, text=True, timeout=APT_TIMEOUT, env=env,
             )
         except subprocess.TimeoutExpired:
             return fail("apt-get %s 超过 %ds 没结束，已放弃" % (verb, APT_TIMEOUT),
