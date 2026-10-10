@@ -1,0 +1,51 @@
+[Unit]
+Description=Autonomic Action Channel - the privileged executor
+Documentation=https://github.com/programmingWTF/AutonomicOS
+# 顺序很实在：actd 要读 agent 的 pid 文件才能给计数器 +1，
+# 而 /run/autonomic 的所有权属于 agent —— actd 只是借用，不该去抢。
+After=autonomic-agent.service
+Requires=autonomic-agent.service
+
+[Service]
+Type=simple
+# 刻意不用 systemd 的 RuntimeDirectory / StateDirectory：
+# 那两个目录的所有权属于 autonomic 用户，actd 是 root，一旦它也声明同名目录，
+# systemd 就会按 unit 的 User 把它 chown 成 root，直接抢了 agent 的地盘
+# （实测表现为 bind() 报 FileNotFoundError —— 目录在 ownership 打架中没了）。
+# 所以这里老老实实借用，不存在才建，绝不改属主。
+ExecStartPre=/bin/mkdir -p /run/autonomic
+ExecStart=/usr/sbin/autonomic-actd
+Restart=always
+RestartSec=3s
+
+# 这一半是有 root 的，所以把它能写的地方逐个钉死，而不是笼统地给它整个磁盘。
+# ProtectSystem=full 而不是 strict：full 保留 /etc 可写（它要改 sysctl.d、
+# systemd unit、/etc/autonomic），strict 会把 /etc 也变成只读。
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectProc=invisible
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+# 纵深防御第二层：即便上面哪条写漏了，能写的地方也只有这四处。
+ReadWritePaths=/etc/autonomic /etc/sysctl.d /etc/systemd/system /var/lib/autonomic
+
+# 它和 agent 共用同一个审计命名空间 —— 一次变更的两半应该出现在同一条日志里，
+# 而不是让你去两个地方拼时间线。
+SyslogIdentifier=autonomic-actd
+LogNamespace=autonomic
+
+# 它是执行器，不是思考者：128M / 10% CPU 足够跑 systemctl 和写文件。
+MemoryMax=128M
+CPUQuota=10%
+TasksMax=32
+
+[Install]
+WantedBy=multi-user.target

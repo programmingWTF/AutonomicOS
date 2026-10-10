@@ -1,103 +1,283 @@
 #!/bin/bash
-# autonomic-install -- 把 live 系统落到硬盘。
+# autonomic-install -- 把 live 系统装到硬盘。
 #
-#   sudo autonomic-install /dev/sdX
+#   sudo autonomic-install                # 向导模式（有 TUI 时）
+#   sudo autonomic-install /dev/sdX       # 直接装，不问话
 #
-# 这不是 debian-installer 那种交互式安装器，它是 CHARTER 里"最小安装器"的实现：
-# 分区 -> 复制当前 live 系统 -> 装 GRUB -> 完事。因为要装的东西就是正在跑的
-# 这套系统，所以没有任何"选择要装什么"的问题 —— 默认值就是全部。
+# 这不是 debian-installer 那种包罗万象的安装器，它是 CHARTER 里"最小安装器"的实现：
+# 分区 -> 复制当前 live 系统 -> 装 GRUB -> 完事。因为要装的东西就是正在跑的这套
+# 系统本身，所以没有"选择装什么"的问题 —— 默认值就是全部。
+#
+# 向导刻意用 whiptail（newt，几百 KB）而不是 Calamares 那类图形安装器：后者会顺手
+# 拖进几百 MB 的 Qt 依赖，把"这一层很薄"这个最有价值的性质整个赔掉。
 #
 # UEFI 机器用 --removable 安装（写 /EFI/BOOT/BOOTX64.EFI），不碰 NVRAM，
 # 这样它像 U 盘一样"插上就能启"，也避免污染宿主的启动项。
 
 set -eu
 
-DISK="${1:-}"
-[ -b "$DISK" ] || { echo "usage: autonomic-install /dev/sdX   (整块盘，不是分区)" >&2; exit 1; }
-[ "$(id -u)" = 0 ] || { echo "needs root" >&2; exit 1; }
-
-echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-echo "!! 这会把 $DISK 整盘抹掉并安装 Autonomic OS"
-echo "!! 10 秒后开始，Ctrl+C 取消"
-echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-sleep 10
-
 MNT=/mnt/autonomic-install
-umount -R "$MNT" 2>/dev/null || true
 
-# ---------------------------------------------------------------- 1. 分区
-parted -s "$DISK" mklabel gpt
-parted -s "$DISK" mkpart ESP fat32 1MiB 513MiB
-parted -s "$DISK" set 1 esp on
-parted -s "$DISK" mkpart root ext4 513MiB 100%
-partprobe "$DISK"
-sleep 2
+# 向导收集出来的值（非交互模式下用下面的默认）
+TARGET_HOSTNAME=autonomic
+NEW_USER=guiyu
+NEW_PASS=autonomic
+LLM_BASE=""
+LLM_KEY=""
+LLM_MODEL="gpt-4o-mini"
 
-# 分区节点命名：nvme0n1 这类以数字结尾的设备要加 p，/dev/sda 这种不要
-case "$DISK" in
-    *[0-9]) ESP="${DISK}p1"; ROOTP="${DISK}p2" ;;
-    *)      ESP="${DISK}1";  ROOTP="${DISK}2" ;;
-esac
+DISK="${1:-}"
 
-# partprobe 之后节点不一定立刻出现，等它
-for _ in $(seq 1 15); do
-    [ -b "$ESP" ] && [ -b "$ROOTP" ] && break
-    partprobe "$DISK" 2>/dev/null || true
-    sleep 1
-done
-[ -b "$ESP" ] && [ -b "$ROOTP" ] || {
-    echo "autonomic-install: partition nodes did not appear ($ESP / $ROOTP)" >&2
+# ---------------------------------------------------------------- 小工具
+
+
+have_tui() {
+    command -v whiptail >/dev/null 2>&1 && [ -t 0 ]
+}
+
+wt() {
+    # whiptail 把结果写 stderr、把界面画到 stdout，所以要 3>&1 1>&2 2>&3 换回来。
+    # 每次都抄这串容易写错，包一层。
+    whiptail "$@" 3>&1 1>&2 2>&3
+}
+
+die() {
+    echo "autonomic-install: $*" >&2
     exit 1
 }
 
-mkfs.fat -F32 "$ESP"
-mkfs.ext4 -F "$ROOTP"
+list_disks() {
+    # NAME SIZE MODEL —— 只列整盘，不列分区
+    lsblk -ndo NAME,SIZE,MODEL 2>/dev/null \
+        | awk '{ n=$1; s=$2; $1=""; $2=""; print "/dev/" n, s " " $0 }'
+}
 
-# ---------------------------------------------------------------- 2. 复制系统
-mkdir -p "$MNT"
-mount "$ROOTP" "$MNT"
-mkdir -p "$MNT/boot/efi"
-mount "$ESP" "$MNT/boot/efi"
 
-echo "autonomic-install: copying the live system..."
-rsync -aHAX \
-    --exclude=/proc --exclude=/sys --exclude=/dev --exclude=/run \
-    --exclude=/tmp --exclude=/media --exclude=/mnt \
-    --exclude="$MNT" \
-    / "$MNT/"
+# ---------------------------------------------------------------- 向导
 
-# rsync 排除掉的目录要补回来（空目录 + 正确权限）
-for d in proc sys dev run tmp media mnt; do
-    mkdir -p "$MNT/$d"
-done
-chmod 1777 "$MNT/tmp"
 
-# ---------------------------------------------------------------- 3. fstab（按 UUID，换机器也不怕）
-ESP_UUID=$(blkid -s UUID -o value "$ESP")
-ROOT_UUID=$(blkid -s UUID -o value "$ROOTP")
-cat > "$MNT/etc/fstab" <<EOF
+wizard() {
+    wt --title "Autonomic OS" --defaultno --yesno \
+"这会选一块整盘，抹掉上面所有数据，装上 Autonomic OS。
+
+这是一个研究原型，装机过程本身没有回退功能。
+
+继续吗？" 16 68 || die "已取消"
+
+    local disks
+    disks=$(list_disks)
+    [ -n "$disks" ] || die "没找到可用磁盘"
+
+    local menu=()
+    while read -r dev rest; do
+        [ -n "$dev" ] || continue
+        menu+=("$dev" "$rest")
+    done <<< "$disks"
+
+    DISK=$(wt --title "选择目标磁盘" --menu \
+"装到哪一块盘？（整盘会被清空）\n用方向键选择，回车确认。" \
+        18 70 8 "${menu[@]}") || die "已取消"
+
+    # 破坏性操作值得让人手打一遍设备名 —— 手会记住眼睛浏览时漏掉的东西
+    local typed
+    typed=$(wt --title "最后确认" --inputbox \
+"即将抹掉：  $DISK
+
+上面的数据无法恢复。
+
+确认请手打一遍设备名：" 14 68 "") || die "已取消"
+    [ "$typed" = "$DISK" ] || die "输入与 $DISK 不一致，已中止（什么都没做）"
+
+    TARGET_HOSTNAME=$(wt --title "主机名" --inputbox \
+"这台机器叫什么？" 10 60 "$TARGET_HOSTNAME") || die "已取消"
+    TARGET_HOSTNAME="${TARGET_HOSTNAME:-autonomic}"
+
+    NEW_USER=$(wt --title "用户" --inputbox \
+"创建一个日常用的普通用户名（带 sudo 权限）：" 10 60 "$NEW_USER") || die "已取消"
+    NEW_USER="${NEW_USER:-guiyu}"
+
+    local p1 p2
+    p1=$(wt --title "口令" --passwordbox \
+"给 $NEW_USER 设一个口令：" 10 60) || die "已取消"
+    p2=$(wt --title "口令" --passwordbox "再输一遍：" 10 60) || die "已取消"
+    [ "$p1" = "$p2" ] || die "两次输入不一致"
+    [ -n "$p1" ] || die "口令不能为空"
+    NEW_PASS="$p1"
+
+    # ---- LLM：这台机器能不能"思考"，就在这一步决定 ----
+    if wt --title "接通 Agent" --defaultno --yesno \
+"要不要现在给 Agent 配一个 LLM 端点？
+
+配了它开机就能思考；不配也能正常装机，
+之后随时可以跑：
+    sudo autonomicctl setup
+
+（不配也不会缺任何功能，只是 agent 暂时还不能思考）" 18 68; then
+        LLM_BASE=$(wt --title "LLM 端点" --inputbox \
+"OpenAI 兼容的 Base URL：\n（例如 https://api.openai.com/v1）" \
+            12 66 "$LLM_BASE") || LLM_BASE=""
+        if [ -n "$LLM_BASE" ]; then
+            LLM_KEY=$(wt --title "API Key" --passwordbox \
+"API Key（输入不回显；装机后落在权限 640 的文件里）：" 10 66) || LLM_KEY=""
+            LLM_MODEL=$(wt --title "模型" --inputbox "模型名：" 10 60 "$LLM_MODEL") || \
+                LLM_MODEL="gpt-4o-mini"
+        fi
+    fi
+
+    local summary
+    summary="目标磁盘    $DISK  (整盘清空)
+主机名      $TARGET_HOSTNAME
+用户        $NEW_USER
+LLM         ${LLM_BASE:-（跳过，之后用 autonomicctl setup 补）}
+模型        ${LLM_BASE:+$LLM_MODEL}"
+
+    wt --title "确认安装" --yesno "$summary
+
+开始安装？" 16 70 || die "已取消"
+}
+
+
+# ---------------------------------------------------------------- 装机
+
+
+partition_and_mount() {
+    echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+    echo "!! 正在抹掉 $DISK 并安装 Autonomic OS"
+    echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+    sleep 3
+
+    umount -R "$MNT" 2>/dev/null || true
+
+    parted -s "$DISK" mklabel gpt
+    parted -s "$DISK" mkpart ESP fat32 1MiB 513MiB
+    parted -s "$DISK" set 1 esp on
+    parted -s "$DISK" mkpart root ext4 513MiB 100%
+    partprobe "$DISK"
+    sleep 2
+
+    # 分区节点命名：nvme0n1 这类数字结尾的要加 p，/dev/sda 这种不要
+    case "$DISK" in
+        *[0-9]) ESP="${DISK}p1"; ROOTP="${DISK}p2" ;;
+        *)      ESP="${DISK}1";  ROOTP="${DISK}2" ;;
+    esac
+
+    for _ in $(seq 1 15); do
+        [ -b "$ESP" ] && [ -b "$ROOTP" ] && break
+        partprobe "$DISK" 2>/dev/null || true
+        sleep 1
+    done
+    [ -b "$ESP" ] && [ -b "$ROOTP" ] || die "分区节点没出现 ($ESP / $ROOTP)"
+
+    mkfs.fat -F32 "$ESP"
+    mkfs.ext4 -F "$ROOTP"
+
+    mkdir -p "$MNT"
+    mount "$ROOTP" "$MNT"
+    mkdir -p "$MNT/boot/efi"
+    mount "$ESP" "$MNT/boot/efi"
+
+    echo "autonomic-install: 复制 live 系统（这步最久）..."
+    rsync -aHAX \
+        --exclude=/proc --exclude=/sys --exclude=/dev --exclude=/run \
+        --exclude=/tmp --exclude=/media --exclude=/mnt \
+        --exclude="$MNT" \
+        / "$MNT/"
+
+    for d in proc sys dev run tmp media mnt; do
+        mkdir -p "$MNT/$d"
+    done
+    chmod 1777 "$MNT/tmp"
+
+    ESP_UUID=$(blkid -s UUID -o value "$ESP")
+    ROOT_UUID=$(blkid -s UUID -o value "$ROOTP")
+    cat > "$MNT/etc/fstab" <<EOF
 UUID=$ROOT_UUID / ext4 defaults 0 1
 UUID=$ESP_UUID /boot/efi vfat umask=0077 0 2
 EOF
+}
 
-# ---------------------------------------------------------------- 4. GRUB
-mount --bind /dev "$MNT/dev"
-mount -t proc proc "$MNT/proc"
-mount -t sysfs sys "$MNT/sys"
+chroot_setup() {
+    # 以下全部作用于**新装的那套系统**，不是当前 live 环境
+    mount --bind /dev "$MNT/dev"
+    mount -t proc proc "$MNT/proc"
+    mount -t sysfs sys "$MNT/sys"
 
-echo "autonomic-install: installing GRUB..."
-chroot "$MNT" /bin/bash -c '
-    export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-    export DEBIAN_FRONTEND=noninteractive
-    grub-install --target=x86_64-efi --efi-directory=/boot/efi \
-        --bootloader-id=AutonomicOS --removable --no-nvram
-    update-grub
-'
+    echo "autonomic-install: 写入这台机器的身份（主机名 / 用户 / LLM）..."
+    echo "$TARGET_HOSTNAME" > "$MNT/etc/hostname"
+    cat > "$MNT/etc/hosts" <<EOF
+127.0.0.1   localhost
+127.0.1.1   $TARGET_HOSTNAME
+::1         localhost ip6-localhost ip6-loopback
+EOF
 
-umount -R "$MNT/dev" "$MNT/proc" "$MNT/sys" 2>/dev/null || true
+    chroot "$MNT" /bin/bash -c '
+        set -eu
+        export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        export DEBIAN_FRONTEND=noninteractive
+        U="$1"; P="$2"
+        if ! id -u "$U" >/dev/null 2>&1; then
+            adduser --disabled-password --gecos "Autonomic OS user" "$U"
+            usermod -aG sudo "$U"
+        fi
+        echo "$U:$P" | chpasswd
+        echo "root:$P" | chpasswd
+    ' _ "$NEW_USER" "$NEW_PASS"
+
+    if [ -n "${LLM_BASE:-}" ] && [ -n "${LLM_KEY:-}" ]; then
+        # 复用包里那个 setup：它知道该怎么放权限、怎么验证。
+        # 这里刻意不把结果当致命错误 —— 装机成功比"LLM 连上了"重要，
+        # 连不上回头一条 autonomicctl setup 就能补。
+        chroot "$MNT" /bin/bash -c '
+            export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+            autonomicctl setup --non-interactive \
+                --base-url "$1" --api-key "$2" --model "$3" 2>&1 | tail -8 || true
+        ' _ "$LLM_BASE" "$LLM_KEY" "$LLM_MODEL"
+    fi
+
+    echo "autonomic-install: 安装 GRUB..."
+    chroot "$MNT" /bin/bash -c '
+        export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        export DEBIAN_FRONTEND=noninteractive
+        grub-install --target=x86_64-efi --efi-directory=/boot/efi \
+            --bootloader-id=AutonomicOS --removable --no-nvram
+        update-grub
+    '
+}
+
+
+# ---------------------------------------------------------------- main
+
+
+[ "$(id -u)" = 0 ] || die "需要 root（试试 sudo）"
+
+if [ -n "$DISK" ]; then
+    [ -b "$DISK" ] || die "usage: autonomic-install [/dev/sdX]   —— 整块盘，不是分区"
+    if ! (partition_and_mount); then exit 1; fi
+else
+    if have_tui; then
+        wizard
+        partition_and_mount
+    else
+        die "没检测到可用 TUI（whiptail/tty）。
+  直接给设备名：sudo autonomic-install /dev/sda
+  或者装 whiptail 后再跑向导。"
+    fi
+fi
+
+chroot_setup
+
+umount -R "$MNT/dev" 2>/dev/null || true
+umount -R "$MNT/proc" 2>/dev/null || true
+umount -R "$MNT/sys" 2>/dev/null || true
 umount -R "$MNT" 2>/dev/null || true
 
 echo
 echo "autonomic-install: 完成。"
-echo "  重启并移除安装介质，机器就会从硬盘启动 Autonomic OS。"
-echo "  （prototype 默认口令 guiyu/autonomic —— 进去第一件事就是改掉）"
+echo "  重启并移除安装介质，就会从硬盘启动 Autonomic OS。"
+echo "  主机名     $TARGET_HOSTNAME"
+echo "  用户       $NEW_USER / （你设的口令）"
+if [ -n "${LLM_BASE:-}" ]; then
+    echo "  LLM        $LLM_BASE  开机后用 autonomicctl llm 复查连通性"
+else
+    echo "  LLM        未配置 —— 开机后跑 sudo autonomicctl setup 补上"
+fi

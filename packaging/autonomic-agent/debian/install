@@ -1,2 +1,10 @@
 src/autonomic-agentd usr/sbin
+src/autonomic-actd usr/sbin
 src/autonomicctl usr/bin
+src/autonomicconf.py usr/share/autonomic
+src/autonomicact.py usr/share/autonomic
+# dh_installsystemd 只认 debian/<包名>.service 这种前缀的文件，
+# autonomic-actd.service 对不上包名 autonomic-agent，会被静默跳过
+# （不报错、也不安装 —— 排查了三次才看出来）。所以这里手动放到位，
+# 启用那步由 postinst 负责。
+debian/autonomic-actd.service lib/systemd/system

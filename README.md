@@ -1,124 +1,165 @@
 # Autonomic OS
 
-> **在 Debian/Ubuntu 之上，做一个"Agent 原生层 + 一套默认值"的可安装系统：
-> 不重写系统，而是让系统第一次把 Agent 当成自己的器官。**
+> **Agent 不是跑在系统上的一个进程，而是系统的一个器官。**
+> 骨头全部来自 Debian/Ubuntu（内核、glibc、systemd、apt 一个字节都不重写），
+> 我们只加一层：让 Agent 成为这台机器的一等公民。
 
-- **对外英文名：`Autonomic OS`**（桂鱼 2026-10-09 定）；中文名待定
-- 定位：**research prototype** —— 只承诺"这个 release 当时能跑"
-- 第一性原理：`docs/CHARTER.md`（不可违背）
-- 代码目录：`D:\Code\AutonomicOS`；旧 `D:\Code\AOS` 是**只读参考**，定位已换代
+<br>
 
-> 最终目标：**一个可以安装在计算机里的操作系统，且原生支持 Agent。**
-> 路线是 仓库 → 包 → 镜像，骨头全部来自 Debian/Ubuntu，我们只加一层默认值。
+> ## ⚠️ 先说清楚：这不保证维护
+>
+> **这是一个研究原型，不是产品，也没有任何形式的维护承诺。**
+>
+> - **没有 LTS、没有版本迁移保证、没有响应时间承诺**
+> - **可能出现无人修复的安全问题** —— 底层安全更新跟着 Ubuntu 上游走，
+>   但这一层（约 1500 行 Python）没有人 7×24 盯着
+> - 它可能停在某个版本不再往前走，也可能某天被推倒重做
+>
+> 它存在的理由是**验证一个命题**：Agent 能不能不靠一个 root shell、
+> 而是靠一条有强制力的通道，真正管住一台机器。
+> 它不是为了成为一个可靠的日常操作系统。
+>
+> **对待它的正确方式是一次实验**：虚拟机里跑、别放生产、别放重要数据、
+> 随时准备好重装。如果你要的是"能用十年的发行版"，这里是错的入口。
 
----
+<br>
 
-## 它和 AOS 的区别（别搞混）
+## 目标
 
-| | AOS（旧，已作废） | Autonomic OS（本仓库） |
+做一个**能装进真机的操作系统**，满足两件事：
+
+1. **完整的 Linux 生态**照常可用 —— 所有 Debian/Ubuntu 的包照常 `apt install`，
+   "AI 系统"不等于一个功能贫瘠的玩具
+2. **任何操作都可以对话完成** —— 不是给你一个好看的聊天框，而是底层真的有一条
+   通道：可预览、可归因、可验证、可回滚
+
+可以有交付界面，但**不追求桌面完整度**；有装机向导，但不追求图形安装器那种排场。
+
+<br>
+
+## 现在到哪了
+
+| | 状态 | 一句话 |
 |---|---|---|
-| 第一性原理 | **不碰系统**：带外控制平面附体在外部 | **成为系统的一部分**：原生、内生、有强制力 |
-| 交付形态 | hypervisor 台架 + 外部控制平面 | **一个独立的、Agent 原生的 Linux 系统** |
-| 与上游关系 | 数据平面零改动 | **衍生版**：骨头与绝大多数包复用 Debian/Ubuntu |
+| **M1** 身份 | ✅ | agent 是 uid/GID/unit/cgroup/日志命名空间齐全的**系统主体**，不是一个 Python 进程 |
+| **M2** 启动 | ✅ | 238 MB ISO 能从 UEFI 起来（已装机到硬盘实测） |
+| **M3** 装机 | ✅ | `autonomic-install /dev/sda` 一条命令落盘，拔盘重启照常进系统 |
+| **M4** 通电 | ✅ | LLM 凭据 + `autonomicctl setup`，密钥走 systemd LoadCredential，不落地到环境变量 |
+| **M5** 通道 | 🚧 | **Action 通道**：dry_run / apply / verify 三段 + 可逆性声明 |
+| **M6** 向导 | ⬜ | 装机 TUI（whiptail），让第二个人也能装上 |
 
-「独立系统」和「复用上游」**不矛盾**：独立性看的是名字 / 发布物 / 仓库 / **默认值** / 一句承诺，
-跟"字节是不是我写的"无关（Ubuntu 的内核也不是 Canonical 写的）。
+每次 push 由 CI 编两遍比对 sha256 发布；apt 仓库是静态站点，丢任何 HTTPS 托管上都能用。
 
----
+<br>
 
-## M1：Agent 在系统里有一个**身份**，而不是一个进程
+## 装它
 
-**状态：✅ 已验收（2026-10-09，17/17 通过，见下）**
+### 方式一：在现有 Debian/Ubuntu 上加一层
 
 ```bash
-# 公网 apt 源（GitHub Pages 托管，CI 自动发布）：
 sudo mkdir -p /etc/apt/keyrings
 curl -fsSL https://programmingwtf.github.io/AutonomicOS/autonomic-archive-keyring.gpg \
   | sudo tee /etc/apt/keyrings/autonomic-archive-keyring.gpg >/dev/null
-echo "deb [signed-by=/etc/apt/keyrings/autonomic-archive-keyring.gpg] https://programmingwtf.github.io/AutonomicOS stable main" \
+echo "deb [signed-by=/etc/apt/keyrings/autonomic-archive-keyring.gpg] \
+https://programmingwtf.github.io/AutonomicOS stable main" \
   | sudo tee /etc/apt/sources.list.d/autonomic.list
 
 sudo apt update && sudo apt install autonomic-agent
-sudo systemctl status autonomic-agent      # 绿
-sudo autonomicctl status                   # 身份全景
+sudo autonomicctl status
 ```
 
-装上之后，Agent 有五样东西：
-
-| 它有的 | 怎么来的 | 为什么这是"身份" |
-|---|---|---|
-| 独立系统用户 | `adduser --system autonomic`（uid 109 / gid 112） | 系统把它当**一个主体**记账，不是 root 下的子进程 |
-| systemd unit | `autonomic-agent.service`，hardening 全开 | 服务管理器认识它、能启停、能设依赖 |
-| cgroup 限额 | `memory.max=268435456`、`cpu.max=25000/100000` | 它占用资源是**受控**的 |
-| 自己的日志命名空间 | `LogNamespace=autonomic` | 有自己的**审计流**，不与系统日志混 |
-| 只读世界版本标记 | `/run/autonomic/world` = `(snapshot_id, action_seq)`，0444 | 计数器在系统外，系统里只有只读投影 → **可检测绕过通道的漂移** |
-
-### 验收结果（原厂 Ubuntu 24.04.5 VM，2026-10-09）
-
-```
-== 1. one line in sources.list, apt update          PASS x3
-== 2. apt install                                    PASS
-== 3. the agent has an identity, not just a process  PASS x8
-      system user: autonomic:x:109:112
-      runs as its own uid (pid=3691 uid=109)
-      cgroup quota live: memory.max=268435456 cpu.max=25000 100000
-      own journal namespace: journalctl --namespace=autonomic
-      world marker: snapshot_id=bootstrap action_seq=0  (mode 444, owner autonomic)
-      Action channel is monotonic: action_seq 0 -> 1
-== 4. clean uninstall                                PASS x5
-====================== PASS=17  FAIL=0 ======================
-```
-
----
-
-## 一条命令看卖点
+### 方式二：整个系统
 
 ```bash
-sudo ./scripts/demo.sh
+./build/build-rootfs.sh && ./build/make-iso.sh     # -> dist/autonomic-os-0.1-amd64.iso
 ```
 
-三段：① 身份全景 ② Action 通道（计数器单调）③ **漂移检测** ——
-绕过通道直接改世界标记，agent 下一个 tick 就会发现并记一条 `WARN`，然后把标记纠正回来。
+ISO 从 UEFI 起来后：`autonomic-install /dev/sda`，关机拔盘，重启就是从硬盘进 Autonomic OS。
 
-> 计数器住在系统外，系统里只有一份只读投影。
-> 投影跟真值对不上，就是有人绕过了通道。
+<br>
 
----
+## 核心：Action 通道
 
-## 构建（可复现）
+**"让 AI 管住整台机器"不等于给它一个 root shell。** 那不是赋权，那是等一个坏天气出事。
+
+真正的做法是给它一条**比 shell 更有强制力**的通道 —— 因为有约束，所以才有力量：
+
+```
+autonomic-agentd   uid=autonomic，ProtectSystem=strict —— 它能思考，碰不到世界
+        │          unix socket，0660 root:autonomic
+        │          连接建立后先用 SO_PEERCRED 验身份，请求字节还没解析就可能被拒
+        ▼
+autonomic-actd     root，但只认四个登记过的原语，读写路径锁在四个前缀内
+```
+
+每个 action 必须回答三个问题，而不是给一个承诺：
 
 ```bash
-./build/build.sh       # -> dist/autonomic-agent_0.1.0-1_all.deb
-./repo/make-repo.sh    # -> repo/out/  （GPG 签名的静态 apt 仓库）
+$ sudo autonomicctl act file.write path=/etc/autonomic/note content="hello"
+
+Action: file.write
+  OK   dry_run  将新建 /etc/autonomic/note（0 行 -> 1 行）
+        可逆  : 是
+
+  真的执行？输入 yes 继续：yes
+
+  OK   apply    已写入 /etc/autonomic/note
+  OK   verify   已核实 /etc/autonomic/note 内容正确
+
+  => file.write 完成。世界版本号已 +1。
 ```
 
-三根支柱：`SOURCE_DATE_EPOCH` 固定 · 权限位在构建前修正 · 基础环境锁定（见 `build/Dockerfile`）。
+- **dry_run** 先告诉你将要发生什么，一个字节都不动
+- **apply** 真的做，每一步进 journal（自己的命名空间）
+- **verify** 事后回到现场再数一遍 —— **verify 和 apply 不一致时，以 verify 为准**，
+  这不是 bug，这是设计
 
-**已验证**：同一棵树连编两次，sha256 完全一致
-（`90214bf310e205c2b3621d643770ffd2f4ac2839f9c4c240b8ecedfdaf8e3060`）。
+以及每个 action 必须声明的性质：**可逆，还是不可逆**。不可逆的事要额外一个显式开关才准做。
 
-CI（`.github/workflows/build.yml`）每次都跑这个"编两次比对"的检查，
-并把 `repo/out/` 发布成静态站点 —— 纯静态目录，丢到任何 HTTPS 托管上就是一个 apt 源。
+### 为什么这套东西不是花架子
 
----
+每次 apply 成功都会让 `action_seq` +1，而这个计数器投影出 `/run/autonomic/world`。
+**世界版本号是真实变更的账本，不是装饰。**
+
+于是：**绕过通道的改动不计数** —— 差异本身就是检测信号。有人偷偷改了世界标记而不走
+Action 通道，agent 下一个 tick 就会 WARN 并纠正回来。这是整套设计里最值钱的一句。
+
+<br>
+
+## 构建
+
+```bash
+./build/build.sh        # -> dist/autonomic-agent_0.2.0-1_all.deb
+./build/build-rootfs.sh # -> 643 MB rootfs（签证我们自己的包 + 改默认值）
+./build/make-iso.sh     # -> dist/autonomic-os-0.1-amd64.iso
+```
+
+可复现：固定 `SOURCE_DATE_EPOCH`、构建前修权限位、锁定基础环境。
+同一棵树连编两次 sha256 一致 —— CI 每次 push 都在跑这个检查。
+
+<br>
+
+## 明确不做
+
+不重写内核 / init / C 库 / 包管理格式 · 不做自己的桌面环境（GNOME 那套 Debian 已经做好
+而且比我们做得好）· 不给 agent 一个 shell 逃生口 · 不做多 Agent 编排 ·
+不做性能优化 —— 现在是要证明这条路走得通，不是要跑分。
+
+<br>
 
 ## 目录
 
 ```
-docs/                        CHARTER.md（权威）· Naming.md · M1.md
-packaging/autonomic-agent/   debian/ + src/（agent 守护进程与 autonomicctl）
-build/                       build.sh · Dockerfile（可复现构建）
-repo/                        make-repo.sh（GPG 签名仓库）
-scripts/                     verify-m1.sh（逐条验收）· demo.sh · serve-repo.sh
+docs/                        CHARTER.md（第一性原理，不可违背）· M1.md · M2.md · M3.md
+packaging/autonomic-agent/   debian/ + src/
+                               autonomic-agentd   身份守护进程（无特权）
+                               autonomic-actd     通道的执行半边（有特权、有边界）
+                               autonomicact.py    原语目录：dry_run/apply/verify + 可逆性
+                               autonomicctl       status / setup / llm / act / actions
+build/                       build.sh · build-rootfs.sh · make-iso.sh · autonomic-install
+scripts/                     install-test.sh（装机全自动验收）· boot-test.sh
 ```
 
----
+<br>
 
-## 明确不做（这一版）
-
-不重写内核 / init / C 库 / 包管理格式 · **不做完整 ISO**（顺序是 仓库 → 包 → ISO）·
-不做自主根因分析 · 不搬旧 VirtualBox 台架 · 不迁移旧 AOS 代码 · 不做多 Agent 编排。
-
----
-
-_Autonomic OS · M1 · 2026-10-09_
+_Autonomic OS · research prototype · 2026-10-11_

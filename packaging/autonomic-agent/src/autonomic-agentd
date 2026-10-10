@@ -1,26 +1,19 @@
 #!/usr/bin/python3
 """autonomic-agentd -- the agent's resident body in the system.
 
-M1 scope (see docs/M1.md): hold the identity and nothing else.
+It holds the identity: the Action counter, the read-only world-version
+projection, and the drift check. See ``docs/M1.md`` for why each of those
+exists.
 
-  1. keeps the Action counter (``action_seq``) in a private state file;
-  2. publishes a READ-ONLY projection of the world version at
-     ``/run/autonomic/world``;
-  3. watches that projection for drift -- if it does not match what the
-     agent last wrote, something changed the world without going through
-     the Action channel, and that is worth a warning line.
-
-That third point is the whole reason the marker is read-only: the counter
-lives outside the system, the system only ever gets a projection of it.
-A projection that disagrees with the source of truth is evidence.
+As of 0.2 it also *knows whether it can think*. A credential without a
+network is still worth nothing, so at boot it resolves the LLM config and
+reports what it found -- but it does not call anything. Every real call
+belongs to the Action channel, behind dry_run/apply/verify. A daemon that
+phones home on startup is not a system citizen, it is a surprise.
 
 Signals
   SIGUSR1  record one Action -- action_seq += 1
   SIGTERM  shut down cleanly
-
-Everything else (user, cgroup quota, journal namespace, hardening) is
-declared in the systemd unit, not here. This process does not try to be
-clever; being a well-behaved system citizen is the product.
 """
 
 from __future__ import annotations
@@ -31,7 +24,12 @@ import signal
 import sys
 import time
 
-VERSION = "0.1.0"
+# 配置模块不在默认路径上（它装在 /usr/share/autonomic/），得先指过去。
+# 开发期从源码目录跑时，用 AUTONOMIC_LIB 覆盖。
+sys.path.insert(0, os.environ.get("AUTONOMIC_LIB", "/usr/share/autonomic"))
+import autonomicconf  # noqa: E402  (必须在改完 sys.path 之后)
+
+VERSION = "0.2.0"
 
 STATE_DIR = "/var/lib/autonomic"
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
@@ -142,15 +140,29 @@ def main() -> int:
     signal.signal(signal.SIGTERM, on_term)
     signal.signal(signal.SIGINT, on_term)
 
+    # ---- 这条神经系统通不通，开机就该知道，而不是等到真要用的时候才发现 ----
+    # 只报告"有没有"，不报告"是什么" —— 密钥本身绝不进日志，一次也不行。
+    conf = autonomicconf.load_config()
+    key, key_src = autonomicconf.load_api_key()
+    if key:
+        llm = "llm=%s model=%s (credential via %s)" % (
+            conf["base_url"],
+            conf["model"],
+            key_src,
+        )
+    else:
+        llm = "llm=unconfigured -- identity without a mind; run autonomicctl setup"
+
     log(
         "INFO",
-        "autonomic-agentd %s up (uid=%d gid=%d world=%s#%d)"
+        "autonomic-agentd %s up (uid=%d gid=%d world=%s#%d %s)"
         % (
             VERSION,
             os.getuid(),
             os.getgid(),
             state["snapshot_id"],
             state["action_seq"],
+            llm,
         ),
     )
 

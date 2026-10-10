@@ -39,6 +39,19 @@ ProtectKernelModules=yes
 ProtectControlGroups=yes
 ProtectClock=yes
 ProtectHostname=yes
+# ---- 密钥不让进程自己去翻 /etc ----
+# 文件本体是 0640 root:autonomic，agent 自己读它其实也够；但走
+# LoadCredential= 的好处是 systemd 从 root 权限打开、把副本挂到一个只有
+# 本服务能读的目录里，密钥从头到尾没进过环境变量 —— journal 里不会有、
+# ps aux 里不会有、crash dump 里更难有。
+# ⚠️ 这个文件必须存在（哪怕是空的占位），否则服务会直接启动失败。
+#    所以 postinst 里一定会把它建出来。
+LoadCredential=autonomic-llm:/etc/autonomic/credentials.env
+
+# ---- 另一件重要的事：它是**连不了整个磁盘的** ----
+# ProtectSystem=strict 下只有 /usr 和 /etc 可读、其余全只读；
+# 加上下面这条，连 /proc 里其他进程的身影都看不见。
+# agent 要写东西请写到 StateDirectory/RuntimeDirectory（systemd 会给它自己那份）。
 ProtectProc=invisible
 RestrictSUIDSGID=yes
 RestrictNamespaces=yes

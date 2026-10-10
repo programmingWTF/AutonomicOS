@@ -1,3 +1,40 @@
+autonomic-agent (0.2.0-1) unstable; urgency=medium
+
+  * Power switch. The agent can now hold credentials for an OpenAI-compatible
+    endpoint and tell you whether it actually works:
+    - /etc/autonomic/agent.conf (0644) holds base_url/model/timeout
+    - /etc/autonomic/credentials.env (0640 root:autonomic) holds the key only
+    - the unit injects it with systemd LoadCredential=, so the secret never
+      enters the process environment and cannot be grepped out of the journal
+    - `autonomicctl setup` writes both (interactive, or --non-interactive for
+      CI) and probes GET /models immediately
+    - `autonomicctl llm` shows the config and re-checks connectivity
+  * At boot the daemon now reports whether it has a usable credential, without
+    calling anything. An unconfigured machine is still Autonomic OS -- it just
+    has identity without a mind.
+  * The Action channel (CHARTER 1.5), which is the reason any of the above
+    matters. A key is useless if the agent cannot do anything with what it
+    decides.
+    The agent is deliberately NOT root. It now has a privileged companion,
+    autonomic-actd, reachable only over a unix socket (0660 root:autonomic)
+    whose peer credentials are read with SO_PEERCRED before the request is
+    even parsed. There is no way to reduce this to a shell: four primitives
+    (file.write, service.set, sysctl.set, self.test), each with a parameter
+    schema and each gated by a write allowlist that refuses /etc/shadow,
+    sudoers, ssh host keys and their neighbours outright.
+  * Every action answers three questions instead of promising one:
+    dry_run (what would change, touching nothing), apply (do it, journal it),
+    verify (go look at the world again). `autonomicctl act` refuses to touch
+    anything it has not shown you first, and always re-checks afterwards.
+    When verify disagrees with apply, verify wins.
+  * Every successful apply signals the counter daemon, so action_seq is now
+    a real ledger of real changes rather than a decorative counter. Things
+    done outside this channel do not move it -- that difference is precisely
+    what drift detection is for.
+  * No new runtime dependencies: urllib from the standard library only.
+
+ -- Autonomic OS <contact@liguiyu.com>  Sat, 11 Oct 2026 00:20:00 +0800
+
 autonomic-agent (0.1.0-1) unstable; urgency=medium
 
   * Initial release. M1: the agent gets an identity in the system --

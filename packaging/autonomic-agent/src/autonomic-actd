@@ -1,0 +1,220 @@
+#!/usr/bin/python3
+"""autonomic-actd -- the privileged half of the Action channel.
+
+autonomic-agentd thinks. It cannot touch the world; it runs as uid=autonomic
+under ProtectSystem=strict and its writable surface is a state directory.
+This daemon is the other half: it holds real privileges and executes a
+registered, constrained set of primitives on the agent's behalf.
+
+Three things keep it honest, and all three matter equally:
+
+  1. **peer credentials.** Every connection is checked with SO_PEERCRED, and
+     anything that is not the autonomic user is refused before a single byte
+     of the request is parsed. The socket being world-readable would not be
+     enough to get in.
+
+  2. **nothing but registered primitives.** It calls
+     ``autonomicact.dispatch`` and nothing else. There is no shell escape, no
+     "run this command" fallback, no admin override. An action that is not in
+     the catalogue does not exist.
+
+  3. **every change advances the world version.** After a successful apply it
+     signals autonomic-agentd, which increments action_seq and re-projects
+     /run/autonomic/world. That is what makes drift detection real: a change
+     made through this channel moves the counter, and a change made any other
+     way leaves the counter standing, which is exactly how we notice it.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import pwd
+import signal
+import socket
+import socketserver
+import struct
+import sys
+import time
+
+sys.path.insert(0, os.environ.get("AUTONOMIC_LIB", "/usr/share/autonomic"))
+import autonomicact  # noqa: E402
+
+VERSION = "0.2.0"
+
+SOCKET_PATH = "/run/autonomic/act.sock"
+AGENT_USER = "autonomic"
+AGENT_PID_FILE = "/run/autonomic/agent.pid"
+MAX_REQUEST_BYTES = 1 << 20
+
+SOCK_MODE = 0o660
+
+
+def log(msg: str) -> None:
+    # systemd 会把 stderr 收进 journal（LogNamespace=autonomic）
+    sys.stderr.write("[%s] %s\n" % (time.strftime("%H:%M:%S"), msg))
+    sys.stderr.flush()
+
+
+def _bump_agent_sequence() -> bool:
+    """apply 成功 => 通知 countersigner：世界动了一次。
+
+    这才是整个 world marker 有意义的原因：它不是装饰性的计数器，它是
+    "这台机器被正式改动过多少次"的账本。绕过通道的改动不计数 ——
+    那种差异本身就是检测信号。
+    """
+    try:
+        with open(AGENT_PID_FILE, "r") as fh:
+            pid = int(fh.read().strip())
+    except (OSError, ValueError):
+        return False
+    try:
+        os.kill(pid, signal.SIGUSR1)
+    except OSError:
+        return False
+    return True
+
+
+class Handler(socketserver.StreamRequestHandler):
+    timeout = 30
+
+    def _reply(self, payload: dict) -> None:
+        self.wfile.write((json.dumps(payload) + "\n").encode("utf-8"))
+        self.wfile.flush()
+
+    def handle(self) -> None:
+        # ---- 你是谁？（在解析任何请求字节之前先回答这个问题）----
+        try:
+            raw = self.connection.getsockopt(
+                socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")
+            )
+            _pid, uid, _gid = struct.unpack("3i", raw)
+        except OSError:
+            uid = -1
+
+        # 放行两种 uid，拒绝其它一切：
+        #   autonomic —— agent 本人，它就是这条通道存在的理由
+        #   root      —— 管理员。拒绝 root 没有任何安全收益：root 直接
+        #                kill 这个进程、或者直接改文件都行，绕一条线而已；
+        #                但**放行**它有好处 —— 管理员手动操作也会走这条通道、
+        #                留下审计记录和 world 版本号，而不是消失在一次 shell 里。
+        # 真正要拒的是第三者：某个被攻破的服务、某个随机用户进程。
+        if uid not in self.server.allowed_uids:
+            log("拒绝连接：对方 uid=%s，只允许 %s"
+                % (uid, sorted(self.server.allowed_uids)))
+            self._reply({"ok": False, "detail": "peer credential rejected"})
+            return
+
+        line = self.rfile.readline(MAX_REQUEST_BYTES)
+        if not line:
+            return
+        try:
+            req = json.loads(line.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            self._reply({"ok": False, "detail": "请求不是合法 JSON"})
+            return
+
+        if not isinstance(req, dict):
+            self._reply({"ok": False, "detail": "请求必须是一个 JSON 对象"})
+            return
+
+        action = str(req.get("action", ""))
+        params = req.get("params") or {}
+        phase = str(req.get("phase") or "dry_run")
+        reason = str(req.get("reason") or "")
+
+        # 「这条通道到底允许做什么」本身也是一个请求 —— 放在这里，客户端就不必
+        # 在本地猜目录，问服务端才是唯一真相。这也是给 LLM 准备的接口：
+        # 它想知道自己能干什么，问一句就能拿到结构化答案。
+        if action in ("", "?", "list", "actions"):
+            self._reply({
+                "ok": True,
+                "catalogue": autonomicact.catalogue(),
+                "write_allowlist": list(autonomicact.WRITE_ALLOWLIST),
+                "write_denylist": list(autonomicact.WRITE_DENYLIST),
+            })
+            return
+
+        if not isinstance(params, dict):
+            self._reply({"ok": False, "detail": "params 必须是对象"})
+            return
+        if "phase" in params or "action" in params:
+            self._reply({"ok": False, "detail": "params 里不许覆盖 action/phase"})
+            return
+
+        started = time.time()
+        result = autonomicact.dispatch(action, params, phase)
+        elapsed = time.time() - started
+
+        if phase == "apply" and result.get("ok") and result.get("changed"):
+            result["sequence_bumped"] = _bump_agent_sequence()
+
+        log("action=%s phase=%s ok=%s changed=%s reversible=%s (%.3fs) reason=%s"
+            % (
+                action,
+                phase,
+                result.get("ok"),
+                result.get("changed"),
+                result.get("reversible"),
+                elapsed,
+                reason or "-",
+            ))
+        self._reply(result)
+
+
+class Server(socketserver.ThreadingUnixStreamServer):
+    daemon_threads = True
+    request_queue_size = 16
+    allowed_uids = frozenset()
+
+
+def main() -> int:
+    try:
+        allowed_uid = pwd.getpwnam(AGENT_USER).pw_uid
+    except KeyError:
+        log("用户 %s 不存在 —— 先装 autonomic-agent" % AGENT_USER)
+        return 1
+
+    try:
+        allowed_gid = pwd.getpwnam(AGENT_USER).pw_gid
+    except KeyError:
+        allowed_gid = 0
+
+    if os.path.exists(SOCKET_PATH):
+        os.unlink(SOCKET_PATH)
+
+    # 兜底：正常情况下 agentd 的 RuntimeDirectory 已经把这个目录建起来了，
+    # 但它万一还没起来，这里自己补上。用 exist_ok，绝不碰已有目录的属主 ——
+    # 那是 agent 的地盘，抢回来会把它那边搞坏（见 unit 里的注释）。
+    os.makedirs(os.path.dirname(SOCKET_PATH), exist_ok=True)
+
+    server = Server(SOCKET_PATH, Handler)
+    # root 也放行：见 Handler.handle 里那段注释。
+    server.allowed_uids = frozenset({allowed_uid, 0})
+
+    # 0660 root:autonomic —— 权限藏在 directory entry 上，就不用靠 actuator
+    # 每次去 check 了。纵深防御：credential 检查 + 文件系统权限，少一层都不行。
+    os.chmod(SOCKET_PATH, SOCK_MODE)
+    try:
+        os.chown(SOCKET_PATH, 0, allowed_gid)
+    except OSError:
+        pass
+
+    log("autonomic-actd %s up (socket=%s mode=0660 accepted-uids=%s actions=%d)"
+        % (VERSION, SOCKET_PATH, sorted(server.allowed_uids),
+           len(autonomicact.ACTIONS)))
+    log("可用 action：%s" % ", ".join(sorted(autonomicact.ACTIONS)))
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+        if os.path.exists(SOCKET_PATH):
+            os.unlink(SOCKET_PATH)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

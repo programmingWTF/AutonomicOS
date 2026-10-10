@@ -19,3 +19,9 @@ override_dh_auto_build:
 override_dh_auto_test:
 override_dh_auto_install:
 override_dh_auto_clean:
+
+# unit 是配置文件不是可执行体。源文件在开发机上常常带着执行位（尤其是
+# Windows 上建出来的），dh_install 会原样保留，于是 dpkg 每次升级都来一句
+# "marked executable"。与其指望每个人的 umask，不如在这儿钉死。
+execute_after_dh_install:
+	chmod 0644 debian/autonomic-agent/lib/systemd/system/autonomic-actd.service

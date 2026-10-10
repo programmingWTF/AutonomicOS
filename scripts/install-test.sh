@@ -66,5 +66,24 @@ $SSH 'echo "os-release: $(head -1 /etc/os-release)";
       systemctl status autonomic-agent --no-pager | sed -n "1,4p";
       autonomicctl status 2>&1 | tail -3' 2>&1
 
+step "7. 验收：Action 通道 —— agent 真的能操作这台机器"
+$SSH 'echo "--- 两个守护进程（思考者 + 执行者）---";
+      systemctl is-active autonomic-agent autonomic-actd;
+      echo;
+      echo "--- 通道愿意做的事，一共就这些 ---";
+      autonomicctl actions 2>&1 | sed -n "1,10p";
+      echo;
+      echo "--- 一次真实变更：预览 -> 执行 -> 复核 ---";
+      autonomicctl act self.test --yes --reason="install acceptance run" 2>&1;
+      echo;
+      echo "--- 世界版本号：一次 apply 应该让它 +1 ---";
+      autonomicctl world 2>&1 | head -2;
+      echo;
+      echo "--- 边界核验：试着写 /etc/shadow，必须被拒 ---";
+      autonomicctl act file.write path=/etc/shadow content=pwned --yes 2>&1 | sed -n "1,6p";
+      echo;
+      echo "--- 凭据落地权限（credentials.env 必须是 640 root:autonomic）---";
+      stat -c "%a %U:%G %n" /etc/autonomic/credentials.env /etc/autonomic/agent.conf 2>&1' 2>&1
+
 echo
-step "完成。虚拟机 $VM 保留（已关机），可随时开机复查。"
+step "完成。虚拟机 $VM 保留（可随时开机复查）。"

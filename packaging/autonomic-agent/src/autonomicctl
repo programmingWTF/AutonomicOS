@@ -1,29 +1,48 @@
 #!/usr/bin/python3
 """autonomicctl -- ask the system how it sees the agent.
 
-The point of this tool is the ``status`` subcommand: one command that shows
-the agent is a *role in the system* (a user, a unit, a cgroup, a journal
-namespace, a world marker) rather than a pile of scripts someone left
-running.
+Two things live here:
+
+  * ``status`` -- proof of identity. One command that shows the agent is a
+    *role in the system* (a user, a unit, a cgroup, a journal namespace, a
+    world marker) rather than a pile of scripts someone left running.
+
+  * ``setup`` / ``llm`` -- the power switch. Without a working base URL and
+    key the agent has an identity but no mind: it can count Actions and
+    publish a world version, but it cannot think about anything.
 
   autonomicctl status   the whole identity, in one screen
   autonomicctl world    the read-only world-version marker
   autonomicctl bump     record one Action through the channel (action_seq += 1)
+  autonomicctl setup    configure base URL / API key / model, then probe it
+  autonomicctl llm      show the current LLM config and check it really works
+  autonomicctl act      run one Action through the channel (preview -> do -> verify)
+  autonomicctl actions  list what the channel is willing to do at all
   autonomicctl version
 """
 
 from __future__ import annotations
 
 import argparse
+import getpass
 import grp
 import json
 import os
 import pwd
 import signal
+import socket
 import subprocess
 import sys
 
-VERSION = "0.1.0"
+# autonomicconf 装在 /usr/share/autonomic/，那不在 Python 的默认搜索路径里。
+# 开发期直接从源码目录跑时，用 AUTONOMIC_LIB 指过去即可。
+sys.path.insert(0, os.environ.get("AUTONOMIC_LIB", "/usr/share/autonomic"))
+import autonomicconf  # noqa: E402  (必须在改完 sys.path 之后)
+
+VERSION = "0.2.0"
+
+# Action 通道的另一半在这里等着。
+ACT_SOCKET = "/run/autonomic/act.sock"
 
 UNIT = "autonomic-agent.service"
 AGENT_USER = "autonomic"
@@ -173,6 +192,252 @@ def cmd_bump(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _mask(key: str) -> str:
+    """露一点点够你认出是哪把钥匙，但不至于把整把钥匙递出去。"""
+    if len(key) <= 8:
+        return "*" * len(key)
+    return "%s...%s" % (key[:3], key[-4:])
+
+
+def _ask(label: str, default: str) -> str:
+    try:
+        raw = input("  %-10s [%s]: " % (label, default)).strip()
+    except EOFError:
+        # 非交互的 stdin（比如 CI 里忘了加 --non-interactive），直接吃默认值，
+        # 而不是崩在一个 traceback 上。
+        return default
+    return raw or default
+
+
+def cmd_llm(args: argparse.Namespace) -> int:
+    conf = autonomicconf.load_config()
+    key, src = autonomicconf.load_api_key()
+
+    print("Autonomic Agent -- LLM 连接")
+    print()
+    print("  base_url  : %s" % conf["base_url"])
+    print("  model     : %s" % conf["model"])
+    print("  timeout   : %ss" % conf["timeout"])
+    if key:
+        print("  api_key   : %s (来自 %s)" % (_mask(key), src))
+    else:
+        print("  api_key   : (未配置)")
+    print()
+
+    if not key:
+        print("  => 没配密钥。这不是故障：这台机器依然是 Autonomic OS，")
+        print("     agent 的身份、限额、审计流都还在 —— 它只是还不能思考。")
+        print("     通电：sudo autonomicctl setup")
+        return 1
+
+    if args.no_probe:
+        print("  (--no-probe：没发请求)")
+        return 0
+
+    print("  连通性检查 ...")
+    res = autonomicconf.probe(
+        conf["base_url"], key, autonomicconf.get_timeout(conf)
+    )
+    if res["ok"]:
+        print("  OK   %s" % res["detail"])
+        print()
+        print("  => agent 这条神经系统是通的。")
+        return 0
+    print("  FAIL %s" % res["detail"])
+    print()
+    print("  => 凭据写进去了，但此刻连不通。可能是没网、可能 URL 少了 /v1、")
+    print("     也可能这把 key 已经失效。改完重跑 autonomicctl llm 即可。")
+    return 1
+
+
+def cmd_setup(args: argparse.Namespace) -> int:
+    if os.geteuid() != 0:
+        print(
+            "autonomicctl setup: 需要 root（要写 /etc/autonomic/）",
+            file=sys.stderr,
+        )
+        return 1
+
+    conf = autonomicconf.load_config()
+    base_url = args.base_url or conf["base_url"]
+    model = args.model or conf["model"]
+    timeout = int(args.timeout) if args.timeout else autonomicconf.get_timeout(conf)
+    key = args.api_key or ""
+
+    existing, _src = autonomicconf.load_api_key()
+
+    if not args.non_interactive:
+        print("Autonomic Agent -- LLM 凭据")
+        print("直接回车 = 用方括号里的值；密钥不回显。")
+        print()
+        base_url = _ask("Base URL", base_url)
+        model = _ask("模型", model)
+        hint = "已配置，回车保留" if existing else "留空则跳过"
+        try:
+            typed = getpass.getpass("  API Key [%s]: " % hint).strip()
+        except EOFError:
+            typed = ""
+        if typed:
+            key = typed
+        elif existing:
+            key = existing
+        print()
+
+    print("写入 %s" % autonomicconf.CONFIG_FILE)
+    autonomicconf.write_config(base_url, model, timeout)
+    os.chmod(autonomicconf.CONFIG_FILE, 0o644)
+
+    if key:
+        print("写入 %s (0640 root:autonomic)" % autonomicconf.CREDENTIALS_FILE)
+        autonomicconf.write_api_key(key)
+    else:
+        print("跳过密钥（留空）。agent 暂时还不能思考。")
+        print("以后随时可以回来：sudo autonomicctl setup")
+        return 0
+
+    print()
+    print("连通性检查 ...")
+    res = autonomicconf.probe(base_url, key, timeout)
+    if res["ok"]:
+        print("  OK   %s" % res["detail"])
+        print()
+        print("生效： systemctl restart autonomic-agent")
+        print("复查： autonomicctl llm")
+        return 0
+
+    print("  FAIL %s" % res["detail"])
+    print()
+    print("凭据已经存好了，只是此刻连不通 —— 没网 / URL 少了 /v1 / key 失效，")
+    print("这三样占了九成。修好之后重跑 autonomicctl llm 验证。")
+    # 仍然是 0：配置这一步本身是成功的，连通性是另一个变量。
+    return 0
+
+
+def _act_call(action: str, params: dict, phase: str, reason: str = "") -> dict:
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(60)
+        sock.connect(ACT_SOCKET)
+    except OSError as exc:
+        return {
+            "ok": False,
+            "detail": "连不上 %s：%s（autonomic-actd 起了吗？）"
+            % (ACT_SOCKET, exc),
+        }
+    try:
+        payload = json.dumps(
+            {"action": action, "params": params, "phase": phase, "reason": reason}
+        )
+        sock.sendall((payload + "\n").encode("utf-8"))
+        buf = b""
+        while not buf.endswith(b"\n") and len(buf) < (1 << 20):
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+        return json.loads(buf.decode("utf-8", "replace"))
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "detail": "通道通信失败：%s" % exc}
+    finally:
+        sock.close()
+
+
+def _dump(label: str, res: dict) -> None:
+    mark = "OK  " if res.get("ok") else "FAIL"
+    print("  %s %-8s %s" % (mark, label, res.get("detail", "")))
+    for key, val in sorted((res.get("evidence") or {}).items()):
+        print("        %-16s %s" % (key, val))
+
+
+def cmd_actions(_args: argparse.Namespace) -> int:
+    res = _act_call("list", {}, "dry_run")
+    cats = res.get("catalogue")
+    if not cats:
+        print("取不到 action 清单：%s" % res.get("detail"), file=sys.stderr)
+        return 1
+    print("Action 通道允许的事（就这些，没有别的）：")
+    print()
+    for item in cats:
+        tag = "可逆" if item["reversible"] else "不可逆"
+        print("  %-14s %s   参数: %s"
+              % (item["name"], tag, ", ".join(item["params"]) or "(无)"))
+    print()
+    for prefix in res.get("write_allowlist", []):
+        print("  可写前缀: %s" % prefix)
+    print()
+    print("  不在这个清单里的东西，通道不接受 —— 没有 shell 逃生口。")
+    return 0
+
+
+def cmd_act(args: argparse.Namespace) -> int:
+    params: dict = {}
+    for pair in args.param or []:
+        key, sep, val = pair.partition("=")
+        if not sep:
+            print("参数要写成 key=value，收到 %r" % pair, file=sys.stderr)
+            return 1
+        params[key] = val
+
+    # ---- 第一件事永远是看清楚，而不是先动手 ----
+    preview = _act_call(args.action, params, "dry_run", args.reason)
+    print("Action: %s" % args.action)
+    if params:
+        print("  参数  : %s" % ", ".join("%s=%s" % kv for kv in sorted(params.items())))
+    if args.reason:
+        print("  理由  : %s" % args.reason)
+    print()
+    if not preview.get("ok"):
+        _dump("dry_run", preview)
+        return 1
+    _dump("dry_run", preview)
+    print("  可逆  : %s" % ("是" if preview.get("reversible")
+                            else "否 —— 做下去就回不来"))
+    if not preview.get("changed"):
+        print()
+        print("  已经处于目标状态，无需执行。")
+        return 0
+
+    if args.phase == "dry_run":
+        print()
+        print("  (--phase=dry_run：什么都没动)")
+        return 0
+
+    # 可逆与否是两级授权：--yes 只是"别问我了"，不可逆的事还得单独点头。
+    if not preview.get("reversible") and not args.force_irreversible:
+        print()
+        print("  这个 action 不可逆。真要继续，请显式加 --force-irreversible。")
+        return 1
+
+    if not args.yes:
+        try:
+            answer = input("\n  真的执行？输入 yes 继续：").strip().lower()
+        except EOFError:
+            answer = ""
+        if answer not in ("yes", "y"):
+            print("  取消。什么都没改。")
+            return 1
+
+    print()
+    applied = _act_call(args.action, params, "apply", args.reason)
+    _dump("apply", applied)
+    if not applied.get("ok"):
+        return 1
+
+    # ---- verify 不是"我相信我做成了"，是去现场再数一遍 ----
+    print()
+    verified = _act_call(args.action, params, "verify", args.reason)
+    _dump("verify", verified)
+    bumped = applied.get("sequence_bumped")
+    print()
+    if verified.get("ok"):
+        print("  => %s 完成。世界版本号%s。"
+              % (args.action, "已 +1" if bumped else "未变（agent 未在运行）"))
+        return 0
+    print("  => apply 报成功，但 verify 不认。以 verify 为准 —— 这是有意的：")
+    print("     承认存在一个与声称不符的证据，比假装成功重要。")
+    return 1
+
+
 def cmd_version(_args: argparse.Namespace) -> int:
     print("autonomicctl %s" % VERSION)
     return 0
@@ -184,6 +449,49 @@ def main() -> int:
     sub.add_parser("status", help="show the agent's identity in this system").set_defaults(fn=cmd_status)
     sub.add_parser("world", help="show the read-only world-version marker").set_defaults(fn=cmd_world)
     sub.add_parser("bump", help="record one Action through the channel").set_defaults(fn=cmd_bump)
+
+    setup = sub.add_parser(
+        "setup", help="configure LLM base URL / API key / model, then probe it"
+    )
+    setup.add_argument("--base-url", default="", help="OpenAI-compatible API root")
+    setup.add_argument("--model", default="", help="model name")
+    setup.add_argument("--api-key", default="", help="the secret; prefer interactive")
+    setup.add_argument("--timeout", default="", help="request timeout in seconds")
+    setup.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help="take everything from flags (for CI / unattended installs)",
+    )
+    setup.set_defaults(fn=cmd_setup)
+
+    llm = sub.add_parser(
+        "llm", help="show LLM config and check the endpoint really answers"
+    )
+    llm.add_argument(
+        "--no-probe", action="store_true", help="print config only, send nothing"
+    )
+    llm.set_defaults(fn=cmd_llm)
+
+    sub.add_parser(
+        "actions", help="list every Action the channel accepts (there is no shell escape)"
+    ).set_defaults(fn=cmd_actions)
+
+    act = sub.add_parser(
+        "act", help="run one Action: always preview first, verify at the end"
+    )
+    act.add_argument("action", help="e.g. file.write, service.set, sysctl.set, self.test")
+    act.add_argument("param", nargs="*", metavar="key=value",
+                     help="action parameters")
+    act.add_argument("--phase", default="apply", choices=("dry_run", "apply"),
+                     help="dry_run = preview only (default: apply)")
+    act.add_argument("--reason", default="", help="why; recorded in the journal")
+    act.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
+    act.add_argument(
+        "--force-irreversible", action="store_true",
+        help="required in addition to --yes for irreversible actions",
+    )
+    act.set_defaults(fn=cmd_act)
+
     sub.add_parser("version", help="print version").set_defaults(fn=cmd_version)
     args = ap.parse_args()
     return args.fn(args)

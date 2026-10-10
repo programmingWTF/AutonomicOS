@@ -20,6 +20,13 @@ OUT="${OUT:-/root/autonomic-rootfs}"
 # 构建机在中国大陆时 archive.ubuntu.com 只有 ~160 kB/s，整个 rootfs 要跑半小时。
 # 镜像只影响构建速度，rootfs 里的源会写成同一个地址，装机后可自行替换。
 MIRROR="${MIRROR:-http://mirrors.aliyun.com/ubuntu}"
+# ⚠️ MIRROR 只是"构建时从哪儿下载"，PUB_MIRROR 才是"装完之后长期去哪儿更新"。
+# 这两件事必须分开：构建机在中国大陆时用 aliyun 快 20 倍，但把 aliyun 写进
+# 发布出去的 ISO 是错的 —— ① 国外用户 apt upgrade 会莫名其妙地慢；
+# ② 一个开源项目把软件源钉在某个厂商镜像上，看着就不像中立上游。
+# 所以 mmdebstrap 阶段照旧走 MIRROR，收尾时再把 sources.list 改写成官方地址。
+PUB_MIRROR="${PUB_MIRROR:-http://archive.ubuntu.com/ubuntu}"
+SEC_MIRROR="${SEC_MIRROR:-http://security.ubuntu.com/ubuntu}"
 # linux-image-generic 会拉 200MB+ 的 modules 包，慢到能把构建拖死；
 # virtual 内核够跑虚拟机和大多数真机，先跑通流程。要装机到裸机时再换 generic。
 KERNEL_PKG="${KERNEL_PKG:-linux-image-virtual}"
@@ -86,6 +93,7 @@ mmdebstrap \
         parted
         dosfstools
         rsync
+        whiptail
     " \
     "$SUITE" "$OUT" \
     "deb $MIRROR $SUITE main restricted universe multiverse" \
@@ -146,6 +154,17 @@ fi
 # ---------------------------------------------------------------- 3. 默认值
 # 独立性 = 默认值必须是我们的。装机后第一次开机就该是这样，
 # 而不是"装完了你自己去配"。
+
+# 软件源：把 mmdebstrap 写进去的 MIRROR 换成发布地址。
+# 这个文件是装机之后长期在用的东西 —— 它决定了这台机器以后从哪儿拿安全更新。
+cat > "$OUT/etc/apt/sources.list" <<EOF
+deb $PUB_MIRROR $SUITE main restricted universe multiverse
+deb $PUB_MIRROR $SUITE-updates main restricted universe multiverse
+deb $PUB_MIRROR $SUITE-backports main restricted universe multiverse
+deb $SEC_MIRROR $SUITE-security main restricted universe multiverse
+EOF
+echo "build-rootfs.sh: apt sources rewritten to $PUB_MIRROR (built via $MIRROR)"
+
 echo "$OS_HOSTNAME" > "$OUT/etc/hostname"
 cat > "$OUT/etc/hosts" <<EOF
 127.0.0.1   localhost
@@ -226,6 +245,11 @@ EOF
 chroot "$OUT" sh -c '
     DEBIAN_FRONTEND=noninteractive apt-get clean
     rm -rf /var/lib/apt/lists/*
+    # apt-get clean 只管 /var/cache/apt/archives 里的 deb，而 pkgcache.bin 和
+    # srcpkgcache.bin 这两个二进制索引缓存它碰都不碰 —— 实测这俩白占 111MB，
+    # 会被原封不动压进 squashfs 然后再进 ISO。这两个索引装机后 apt update
+    # 会自己重建，留着毫无用处。
+    rm -rf /var/cache/apt/*
 '
 umount_chroot
 

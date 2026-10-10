@@ -5,8 +5,10 @@
 # 插入在文末那个 DEBHELPER 占位符的位置。顺序很重要 —— 用户必须先存在，
 # 服务才能以 User=autonomic 启动，所以自定义代码放在占位符之前。
 #
-# ⚠️ 注释里千万别写字面的 #DEBHELPER#：debhelper 会把它替换成一段代码，
-# 注释结构被撑破，剩下的中文会被 shell 当成命令执行（"xxx: not found"）。
+# ⚠️ 千万别在注释里把 debhelper 的占位符原样写出来（就是文末那个全大写的标记）：
+# debhelper 对它是**无差别文本替换**，写在注释里也一样会被替换成一段代码，
+# 注释结构当场被撑破，剩下的中文会被 shell 当成命令去执行
+# （症状是一串莫名其妙的 "xxx: not found"）。这个坑已经踩过两次了。
 
 set -e
 
@@ -39,6 +41,59 @@ case "$1" in
                 > "$STATE_DIR/state.json"
             chown "$AGENT_USER:$AGENT_GROUP" "$STATE_DIR/state.json"
             chmod 0640 "$STATE_DIR/state.json"
+        fi
+
+        # ---- LLM 凭据：两个文件分开，而且**都必须存在** ----
+        # agent.conf 放的是非敏感配置（base_url / model / timeout），
+        # credentials.env 只放密钥。分开之后配置文件可以贴进 issue 求助，
+        # 而密钥那 40 个字节要一辈子待在这台机器里。
+        CONF_DIR=/etc/autonomic
+        mkdir -p "$CONF_DIR"
+        chown root:"$AGENT_GROUP" "$CONF_DIR"
+        chmod 0755 "$CONF_DIR"
+
+        # 第一次装上给一份带注释的默认值；**升级时不覆盖**已有的配置
+        # （否则用户改的 model 会在某次 apt upgrade 之后悄悄回到 gpt-4o-mini）。
+        #
+        # 直接在这里写，而不是从 /usr/share 拷一份模板：dh_install 处理单个
+        # 模板文件时行为尴尬（实测会装成同名目录而不是文件），多一个环节
+        # 就多一个失败点。默认值本来就只有五行，写在这儿还更好读。
+        if [ ! -f "$CONF_DIR/agent.conf" ]; then
+            cat > "$CONF_DIR/agent.conf" <<'CONF'
+# Autonomic Agent -- 非敏感配置（密钥不在这里，在那边的 credentials.env）
+#
+# base_url   OpenAI 兼容的 API 根路径，注意要不要带 /v1：
+#              OpenAI    https://api.openai.com/v1
+#              本地推理  http://localhost:11434/v1
+# model      模型名。autonomicctl llm 会真的去问服务端能不能用。
+# timeout    单次请求超时（秒）。别设太长：agent 是受限主体，卡住的请求
+#            会一直占着它的 CPU 配额。
+
+base_url = https://api.openai.com/v1
+model    = gpt-4o-mini
+timeout  = 20
+CONF
+            chmod 0644 "$CONF_DIR/agent.conf"
+        fi
+
+        # 密钥文件这里只建一个空格子 —— 里面不许有任何真实密钥，
+        # ISO 里因此也不可能有。真正写进去要走 autonomicctl setup。
+        # 之所以必须存在：unit 里的 LoadCredential= 找不到文件会让服务
+        # 直接启动失败，一个还没配 LLM 的机器也应该能正常开机跑 agent。
+        if [ ! -f "$CONF_DIR/credentials.env" ]; then
+            printf '%s\n' \
+                '# 空的。用 autonomicctl setup 写入密钥。' \
+                > "$CONF_DIR/credentials.env"
+        fi
+        chown root:"$AGENT_GROUP" "$CONF_DIR/credentials.env"
+        chmod 0640 "$CONF_DIR/credentials.env"
+
+        # 通道的执行半边。它的 unit 由 debian/install 手动放到位，所以
+        # enable 也得在这儿做（debhelper 不知道有这个 unit 存在）。
+        # 装在容器内 / chroot 里时 /run/systemd/system 不存在 —— 那是没跑 systemd，
+        # 不强求。
+        if [ -d /run/systemd/system ]; then
+            systemctl enable autonomic-actd.service >/dev/null 2>&1 || true
         fi
         ;;
 esac

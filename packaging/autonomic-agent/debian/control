@@ -16,6 +16,13 @@ Description: agent-native identity layer for Debian and Ubuntu
  quota, its own journal namespace, and a read-only world-version
  marker used to detect changes that bypassed the Action channel.
  .
+ Since 0.2 it can also hold credentials for an OpenAI-compatible
+ endpoint. The key lives apart from the config (0640, injected by
+ systemd with LoadCredential= so it never enters the environment),
+ and `autonomicctl llm` will tell you whether it actually works.
+ A machine with no credential configured is still Autonomic OS --
+ identity without a mind, which is a state, not an error.
+ .
  Part of Autonomic OS -- a research prototype. It reuses the Debian
  and Ubuntu bones (kernel, glibc, systemd, dpkg) and adds a layer of
  agent-native defaults. No warranty beyond "this release built and
