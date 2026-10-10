@@ -47,7 +47,7 @@ import socket
 import subprocess
 import time
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 # ------------------------------------------------------------------ 写权限边界
 # 白名单，不是黑名单。

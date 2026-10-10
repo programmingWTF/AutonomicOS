@@ -48,7 +48,7 @@ sys.path.insert(0, os.environ.get("AUTONOMIC_LIB", "/usr/share/autonomic"))
 import autonomicconf  # noqa: E402  (必须在改完 sys.path 之后)
 import autonomicplan  # noqa: E402  (同上：自然语言 -> 受校验的动作)
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 # Action 通道的另一半在这里等着。
 ACT_SOCKET = "/run/autonomic/act.sock"

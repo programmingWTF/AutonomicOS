@@ -42,7 +42,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 # 一个计划最多几步。这不是怕模型想太多，是把爆炸半径写死在代码里：
 # 一次对话最多能把世界改成什么样，必须是个可以写出来的数字。

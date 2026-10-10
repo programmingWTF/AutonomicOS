@@ -1,3 +1,29 @@
+autonomic-agent (0.4.0-1) unstable; urgency=medium
+
+  * More primitives, not more power. The channel grows from 5 actions to 9,
+    and not one constraint was loosened to make that happen.
+    - pkg.install / pkg.remove / pkg.list: apt. This is the first action that
+      *executes code other people wrote* -- a Debian postinst runs as root --
+      so package names are held to the Debian character set, may not start
+      with '-', and may not pin a version. "--allow-unauthenticated" would
+      otherwise be eaten by apt as its own option, and a pinned version is a
+      way to choose one with a known hole. Five packages per action, max:
+      the blast radius lives in code, not in the caller's restraint.
+    - pkg.list is the read-only one: an LLM planning to install nginx should
+      be able to ask whether apache is already there first.
+    - dry_run runs `apt-get -s` so apt itself computes the dependency tree,
+      and verify asks dpkg-query what the status is *now* rather than
+      believing what apt said.
+    - user.add: the first irreversible primitive, and the first thing that
+      makes --force-irreversible actually do something. Deleting a user does
+      not take its files, its running services, or its UID recorded in other
+      config along with it, so declaring this reversible would be a lie. The
+      extra pause that flag buys is the safety mechanism, not a formality.
+  * scripts/test-primitives.py: 39 assertions over the argument guards, all
+    pure functions, now part of CI.
+
+ -- Autonomic OS <autonomic@localhost>  Sat, 11 Oct 2026 04:00:00 +0000
+
 autonomic-agent (0.3.0-1) unstable; urgency=medium
 
   * Planned action: plain words in, audited actions out. This is the missing

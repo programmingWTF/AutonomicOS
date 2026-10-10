@@ -29,7 +29,7 @@ import time
 sys.path.insert(0, os.environ.get("AUTONOMIC_LIB", "/usr/share/autonomic"))
 import autonomicconf  # noqa: E402  (必须在改完 sys.path 之后)
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 STATE_DIR = "/var/lib/autonomic"
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
