@@ -41,7 +41,9 @@ fi
 echo "build.sh: SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH"
 echo "build.sh: source tree   $SRC"
 
-rm -rf "$DIST"
+# 只清自己产出的东西，别 rm -rf 整个 dist：那里可能还放着 ISO，
+# 而 ISO 正被某个虚拟机挂着的概率不小 —— 一被占用 rm 就失败，整条链断在第一步。
+rm -f "$DIST"/*.deb "$DIST"/BUILDINFO.txt
 mkdir -p "$DIST"
 
 # dpkg-buildpackage 会把产物放在源码树的**父目录**，所以在临时目录里构建

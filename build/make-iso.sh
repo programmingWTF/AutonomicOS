@@ -11,9 +11,11 @@
 
 set -eu
 
-ROOTFS="${ROOTFS:-/tmp/autonomic-rootfs}"
-ISO_DIR="${ISO_DIR:-/tmp/autonomic-iso}"
-OUT="${OUT:-/tmp/autonomic-os-0.1-amd64.iso}"
+# 同样别用 /tmp（WSL 的 tmpfs，实例终止即丢），见 build/build-rootfs.sh 里的说明。
+ROOTFS="${ROOTFS:-/root/autonomic-rootfs}"
+ISO_DIR="${ISO_DIR:-/root/autonomic-iso}"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+OUT="${OUT:-$ROOT/dist/autonomic-os-0.1-amd64.iso}"
 LABEL="${LABEL:-AUTONOMIC_OS}"
 
 [ -d "$ROOTFS" ] || { echo "make-iso.sh: no rootfs at $ROOTFS -- run build/build-rootfs.sh" >&2; exit 1; }
@@ -30,6 +32,17 @@ echo "make-iso.sh: rootfs=$ROOTFS -> $OUT"
 # 不管 live-boot 是不是已经装了，initramfs 都必须重生成一次 ——
 # 只有带着 live 钩子的 initramfs 才认得 squashfs 根。
 echo "make-iso.sh: ensuring live-boot + regenerating initramfs"
+
+# rootfs 里的 /etc/resolv.conf 被指到了 systemd-resolved 的 stub，
+# 但那东西要系统真正跑起来才有 —— 在 chroot 里它是个坏链接，apt 的 DNS 全废，
+# 症状是 "Temporary failure resolving ..."。临时塞一个能用的进去，用完还原。
+cp /etc/resolv.conf "$ROOTFS/etc/resolv.conf.buildbak" 2>/dev/null || true
+# 它多半是个指向 /run/systemd/resolve/stub-resolv.conf 的**符号链接**，
+# 直接 > 重定向只会写进那个还不存在的目标文件，等于什么都没做。
+# 必须先删掉链接本身，再写真实文件。
+rm -f "$ROOTFS/etc/resolv.conf"
+printf 'nameserver 223.5.5.5\nnameserver 8.8.8.8\n' > "$ROOTFS/etc/resolv.conf"
+
 mount -t proc proc "$ROOTFS/proc" 2>/dev/null || true
 mount --bind /dev "$ROOTFS/dev" 2>/dev/null || true
 chroot "$ROOTFS" sh -c '
@@ -43,6 +56,9 @@ chroot "$ROOTFS" sh -c '
 '
 umount -l "$ROOTFS/dev" 2>/dev/null || true
 umount -l "$ROOTFS/proc" 2>/dev/null || true
+
+[ -f "$ROOTFS/etc/resolv.conf.buildbak" ] \
+    && mv "$ROOTFS/etc/resolv.conf.buildbak" "$ROOTFS/etc/resolv.conf"
 
 # ---------------------------------------------------------------- 2. 内核与 initramfs
 rm -rf "$ISO_DIR"
@@ -81,13 +97,15 @@ insmod ext2
 insmod squash4
 insmod loopback
 
+# 串口 console 是给 headless 调试用的：VirtualBox 无头模式截图经常拿到 0x0，
+# 只有 ttyS0 能告诉我们它到底起没起来、卡在哪一步。
 menuentry "Autonomic OS (live)" {
-    linux /live/vmlinuz boot=live components quiet splash
+    linux /live/vmlinuz boot=live components console=ttyS0,115200 console=tty0
     initrd /live/initrd.img
 }
 
 menuentry "Autonomic OS (live, verbose)" {
-    linux /live/vmlinuz boot=live components
+    linux /live/vmlinuz boot=live components console=ttyS0,115200 console=tty0 debug
     initrd /live/initrd.img
 }
 EOF

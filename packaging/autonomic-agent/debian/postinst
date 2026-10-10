@@ -2,8 +2,11 @@
 # postinst -- 建立 Agent 的"身份"：专有系统用户 + 它自己的状态目录。
 #
 # 这里刻意不碰 systemd 的 enable/start：那段由 debhelper 生成，
-# 插入在下面的 #DEBHELPER# 位置。顺序很重要 —— 用户必须先存在，
-# 服务才能以 User=autonomic 启动，所以自定义代码放在 #DEBHELPER# 之前。
+# 插入在文末那个 DEBHELPER 占位符的位置。顺序很重要 —— 用户必须先存在，
+# 服务才能以 User=autonomic 启动，所以自定义代码放在占位符之前。
+#
+# ⚠️ 注释里千万别写字面的 #DEBHELPER#：debhelper 会把它替换成一段代码，
+# 注释结构被撑破，剩下的中文会被 shell 当成命令执行（"xxx: not found"）。
 
 set -e
 

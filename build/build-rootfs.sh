@@ -14,12 +14,19 @@
 set -eu
 
 SUITE="${SUITE:-noble}"                       # Ubuntu 24.04 LTS
-OUT="${OUT:-/tmp/autonomic-rootfs}"
+# ⚠️ 别用 /tmp：WSL 的 /tmp 是 tmpfs，WSL 实例一终止（比如构建跑完、或机器休眠）
+# 内容就没了 —— 昨晚就是这样白跑了一整轮。必须落在 ext4 的持久路径上。
+OUT="${OUT:-/root/autonomic-rootfs}"
 # 构建机在中国大陆时 archive.ubuntu.com 只有 ~160 kB/s，整个 rootfs 要跑半小时。
 # 镜像只影响构建速度，rootfs 里的源会写成同一个地址，装机后可自行替换。
 MIRROR="${MIRROR:-http://mirrors.aliyun.com/ubuntu}"
+# linux-image-generic 会拉 200MB+ 的 modules 包，慢到能把构建拖死；
+# virtual 内核够跑虚拟机和大多数真机，先跑通流程。要装机到裸机时再换 generic。
+KERNEL_PKG="${KERNEL_PKG:-linux-image-virtual}"
 REPO_URL="${AUTONOMIC_REPO_URL:-https://programmingWTF.github.io/AutonomicOS}"
-HOSTNAME="${HOSTNAME:-autonomic}"
+# ⚠️ 别用 HOSTNAME 当变量名：它是 bash 内置变量，WSL 里早就等于宿主机名，
+# ${HOSTNAME:-autonomic} 永远取到宿主机名（ThinkBook），默认值形同虚设。
+OS_HOSTNAME="${OS_HOSTNAME:-autonomic}"
 ROOT_PASSWORD="${ROOT_PASSWORD:-autonomic}"   # prototype 默认值，装机后第一件事就是改掉
 USER_NAME="${USER_NAME:-guiyu}"
 USER_PASSWORD="${USER_PASSWORD:-autonomic}"
@@ -40,6 +47,9 @@ echo "build-rootfs.sh: suite=$SUITE out=$OUT mirror=$MIRROR"
 # 光给 apt 传 -o Proxy=DIRECT 不够（环境变量会赢），必须把变量也清掉。
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY || true
 export DEBIAN_FRONTEND=noninteractive
+# chroot 会继承宿主的 PATH，而 WSL 的 PATH 里塞了一长串 /mnt/c 下的 Windows 目录。
+# 在 rootfs 内部那条 PATH 是没用的，结果是 chroot 里连 apt-get 都找不到。
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export APT_DIRECT='Acquire::http::Proxy "DIRECT"'
 export APT_DIRECT_HTTPS='Acquire::https::Proxy "DIRECT"'
 
@@ -47,13 +57,15 @@ rm -rf "$OUT"
 
 # ---------------------------------------------------------------- 1. 骨头
 # 注意这里没有一样是我们自己写的：内核、init、C 库、包管理全部来自上游。
+# variant 必须是 apt（= essential + apt）：mmdebstrap 的 minbase 里**没有 apt**，
+# 装出来的 rootfs 只有 dpkg，进 chroot 后 apt-get: not found。
 mmdebstrap \
-    --variant=minbase \
+    --variant=apt \
     --architecture=amd64 \
     --aptopt="$APT_DIRECT" \
     --aptopt="$APT_DIRECT_HTTPS" \
     --include="
-        linux-image-generic
+        $KERNEL_PKG
         grub-efi-amd64
         initramfs-tools
         systemd-sysv
@@ -68,7 +80,6 @@ mmdebstrap \
         iproute2
         iputils-ping
         locales
-        keyboard-configuration
         nano
         python3
         adduser
@@ -134,10 +145,10 @@ fi
 # ---------------------------------------------------------------- 3. 默认值
 # 独立性 = 默认值必须是我们的。装机后第一次开机就该是这样，
 # 而不是"装完了你自己去配"。
-echo "$HOSTNAME" > "$OUT/etc/hostname"
+echo "$OS_HOSTNAME" > "$OUT/etc/hostname"
 cat > "$OUT/etc/hosts" <<EOF
 127.0.0.1   localhost
-127.0.1.1   $HOSTNAME
+127.0.1.1   $OS_HOSTNAME
 ::1         localhost ip6-localhost ip6-loopback
 EOF
 
@@ -170,6 +181,11 @@ chroot "$OUT" sh -c '
     sed -i "s/^#\?PasswordAuthentication.*/PasswordAuthentication yes/" /etc/ssh/sshd_config
     systemctl enable ssh
 '
+
+# 登录横幅（getty 读的是 /etc/issue，不是 os-release —— 不写它，
+# 开机第一眼还是 "Ubuntu 24.04 LTS"，默认值就白设了）
+printf '%s\n' 'Autonomic OS 0.1 (research prototype)' ' \l' '' > "$OUT/etc/issue"
+cp "$OUT/etc/issue" "$OUT/etc/issue.net"
 
 # release 标识 —— 让人一眼知道这是哪个系统
 cat > "$OUT/etc/os-release" <<EOF
