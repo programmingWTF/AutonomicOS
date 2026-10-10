@@ -83,7 +83,17 @@ $SSH 'echo "--- 两个守护进程（思考者 + 执行者）---";
       autonomicctl act file.write path=/etc/shadow content=pwned --yes 2>&1 | sed -n "1,6p";
       echo;
       echo "--- 凭据落地权限（credentials.env 必须是 640 root:autonomic）---";
-      stat -c "%a %U:%G %n" /etc/autonomic/credentials.env /etc/autonomic/agent.conf 2>&1' 2>&1
+      stat -c "%a %U:%G %n" /etc/autonomic/credentials.env /etc/autonomic/agent.conf 2>&1;
+      echo;
+      echo "--- 不可逆原语的两级授权：只给 --yes 时必须仍被拦下 ---";
+      echo "  （这一步不会真的建用户：dry_run 在授权检查之后才跑，被拦下就没到那一步）";
+      autonomicctl act user.add name=aos-acceptance-probe --yes 2>&1 | sed -n "1,8p";
+      echo;
+      echo "--- 反过来：用户名非法时，连 dry_run 都进不去 ---";
+      autonomicctl act user.add name="Bad;Name" --yes 2>&1 | sed -n "1,4p";
+      echo;
+      echo "--- 包名注入守卫 ---";
+      autonomicctl act pkg.install packages="nginx; rm -rf /" --yes 2>&1 | sed -n "1,4p"' 2>&1
 
 step "8. 验收：AI 闭环 —— 说人话 -> 校验 -> 预演 -> 落地 -> 回滚"
 # 这一节用仓库自带的假 LLM 端点（scripts/mock-llm.py）在**虚机里**跑完整条
@@ -91,11 +101,33 @@ step "8. 验收：AI 闭环 —— 说人话 -> 校验 -> 预演 -> 落地 -> �
 # "你确实按纪律做了"—— 不许部分执行、预演先于落地、每步单独核实、
 # 越界整份退回。这些性质跟对面是真 GPT 还是假服务毫无关系，而用假的
 # 可以重复上千遍、每次返回的字节一模一样。
-$SSH 'pkill -f mock-llm.py 2>/dev/null; sleep 1;
-      python3 /usr/local/share/mock-llm.py --port 8099 >/tmp/mockllm.log 2>&1 &
-      sleep 2;
+# ⚠️ 起后台进程这件事有两个坑，都踩过，别再回头：
+#
+# 坑 A：`python3 ... &` 之后 SSH 命令一结束，进程就跟会话一起被收走 ——
+#       症状是"起过、但下一秒就没了"，setup 永远 connection refused。
+#       （曾以为 setsid 能解决，但它并不总能脱开 SSH 继承的 fd。）
+#
+# 坑 B（更阴）：`pkill -f mock-llm.py` 写在这条 SSH 命令里时，
+#       **pkill 会匹配到承载这条命令的 shell 自己**（它的命令行里就含
+#       "mock-llm.py" 这几个字），于是把自己杀掉 —— SSH 返回 255、
+#       整段输出凭空消失。看起来像"网络问题"，其实是自杀。
+#
+# 正解：交给 systemd 托管。`systemd-run` 让进程完全脱离本次 SSH 会话，
+# 不继承任何 fd，也不再和这条命令的文本产生任何关系。
+# 停它用 `systemctl stop`，不用 pkill，于是坑 B 也一并消失。
+$SSH 'systemctl stop aosmock 2>/dev/null; systemctl reset-failed aosmock 2>/dev/null;
+      systemd-run --unit=aosmock --collect \
+          python3 /usr/local/share/mock-llm.py --port 8099 >/tmp/mockrun.txt 2>&1;
+      sleep 3;
+      echo "--- mock 端点自检 ---";
+      systemctl is-active aosmock;
+      curl -s -m 5 http://127.0.0.1:8099/v1/models | head -c 160; echo;
+      echo "--- 写入 LLM 凭据 ---";
       autonomicctl setup --base-url http://127.0.0.1:8099/v1 --api-key mock-key \
-          --model mock-1 --non-interactive 2>&1 | tail -3' 2>&1
+          --model mock-1 --non-interactive 2>&1 | head -6;
+      echo "--- 凭据落地核实 ---";
+      ls -la /etc/autonomic/credentials.env;
+      grep -c "mock-key" /etc/autonomic/credentials.env' 2>&1
 
 echo
 echo "--- 8a. 合法计划：两步，必须全部预演通过后才落地 ---"
@@ -153,7 +185,7 @@ $SSH 'ls -1 /var/lib/autonomic/plans/ 2>/dev/null | tail -3;
       echo "--- 审计文件片段 ---";
       tail -c 600 "$(ls -t /var/lib/autonomic/plans/*.json | head -1)"' 2>&1
 
-$SSH 'pkill -f mock-llm.py 2>/dev/null; true' 2>&1
+$SSH 'systemctl stop aosmock 2>/dev/null; systemctl reset-failed aosmock 2>/dev/null; true' 2>&1
 
 echo
 step "完成。虚拟机 $VM 保留（可随时开机复查）。"
