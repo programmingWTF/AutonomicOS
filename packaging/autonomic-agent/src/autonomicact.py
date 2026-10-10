@@ -206,6 +206,11 @@ def _backup(path: str) -> str:
     第二次会静默覆盖第一次的备份 —— 也就是把"上一版"弄丢了。回滚从来
     都是为了回到上一个状态，备份之间互相覆盖等于没备份。
 
+    ⚠️ 微秒只能用 time.time() 自己算，**不能用 strftime("%f")** ——
+    strftime 里根本没有 %f 这个指令（那是 datetime 的），它会把 %f
+    原样吐出来，于是备份名里出现一个字面的 "%f"。后果和"只到秒"完全
+    一样：同一秒内的两次备份还是撞在一起。这个坑已经踩过一次了。
+
     除了内容副本，还写一个同名 .json 的 sidecar 记录它**原本属于哪里**。
     这不是冗余：备份名里的路径分隔符是 `_`，而 Linux 路径本身允许 `_`，
     所以 `/etc/autonomic/my_conf` 编码成 `etc_autonomic_my_conf` 之后，
@@ -216,7 +221,12 @@ def _backup(path: str) -> str:
     if not os.path.exists(path):
         return ""
     os.makedirs(BACKUP_DIR, exist_ok=True)
-    stamp = time.strftime("%Y%m%dT%H%M%S%f")
+    now = time.time()
+    micros = int(round((now - int(now)) * 1_000_000))
+    # 万一四舍五入到 1000000（闰秒级的边界），挪进下一秒，别产生 7 位数
+    if micros >= 1_000_000:
+        micros = 999_999
+    stamp = "%s%06d" % (time.strftime("%Y%m%dT%H%M%S", time.localtime(now)), micros)
     target = os.path.join(
         BACKUP_DIR, "%s_%s" % (stamp, path.strip("/").replace("/", "_"))
     )

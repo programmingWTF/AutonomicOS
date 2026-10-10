@@ -111,14 +111,41 @@ $SSH 'autonomicctl ask "mode=badstep 删掉根目录" --yes 2>&1 | tail -6' 2>&1
 
 echo
 echo "--- 8d. 回滚：先改，再用 file.restore 收回去 ---"
-$SSH 'printf "%s\n" "before = 原始内容" > /etc/autonomic/rollback-demo.conf
+# 这一节的关键是**读回内容来判**，而不是信输出的"完成"两个字。
+# 之前这里踩过一个坑：先写文件再 apply，备份是在写完**之后**取的，
+# 于是 sha256_before 和 sha256_target 相同，restore 正确地判定
+# "已经就是备份里的样子，无需还原"，输出却是"完成" —— 测试看着绿，
+# 实际上什么都没验证到。所以现在：
+#   ① 先落一个已知原稿 ② 记下它的 sha ③ 改 ④ 还原 ⑤ 逐字节比对原稿
+$SSH 'set -e
+      rm -f /etc/autonomic/rollback-demo.conf
+      printf "%s\n" "before = 原始内容" > /etc/autonomic/rollback-demo.conf
+      ORIG_SHA=$(sha256sum /etc/autonomic/rollback-demo.conf | cut -d" " -f1)
+      echo "  原稿 sha : $ORIG_SHA"
+
       autonomicctl act file.write path=/etc/autonomic/rollback-demo.conf \
-          content="after = 被 AI 改过" --yes --reason="回滚演示" 2>&1 | tail -4
-      echo "  改后: $(cat /etc/autonomic/rollback-demo.conf)"
+          content="after = 被 AI 改过" --yes --reason="回滚演示" >/dev/null 2>&1
+      echo "  改后内容 : $(cat /etc/autonomic/rollback-demo.conf)"
+
+      # 备份名里不允许出现字面的 %f（strftime 没有这个指令）
       BK=$(ls -t /var/lib/autonomic/backups/*rollback-demo.conf 2>/dev/null | head -1)
-      echo "  备份: $BK"
-      autonomicctl act file.restore backup="$BK" --yes --reason="回滚演示" 2>&1 | tail -4
-      echo "  还原后: $(cat /etc/autonomic/rollback-demo.conf)"' 2>&1
+      echo "  备份     : $BK"
+      case "$BK" in
+        *%f*) echo "  !! 备份名里出现字面 %f —— 微秒没生效，同秒内会互相覆盖";;
+      esac
+      echo "  sidecar  : $(cat "$BK.json" 2>/dev/null | head -c 120)"
+
+      autonomicctl act file.restore backup="$BK" --yes --reason="回滚演示" >/dev/null 2>&1
+      NEW_SHA=$(sha256sum /etc/autonomic/rollback-demo.conf | cut -d" " -f1)
+      echo "  还原后   : $(cat /etc/autonomic/rollback-demo.conf)"
+      if [ "$NEW_SHA" = "$ORIG_SHA" ]; then
+          echo "  => PASS 逐字节回到原稿（sha 一致）"
+      else
+          echo "  => FAIL 没有回到原稿（$NEW_SHA != $ORIG_SHA）"
+      fi
+      echo
+      echo "  --- autonomicctl backups 视角 ---"
+      autonomicctl backups 2>&1 | head -8' 2>&1
 
 echo
 echo "--- 8e. 每次改动都留痕，且日志可读 ---"
