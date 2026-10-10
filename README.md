@@ -210,21 +210,26 @@ sudo autonomicctl ask "把通道自检再做一遍"
 
 不重写内核 / init / C 库 / 包管理格式 · 不做自己的桌面环境（GNOME 那套 Debian 已经做好
 而且比我们做得好）· 不给 agent 一个 shell 逃生口 · 不做多 Agent 编排 ·
-不做性能优化 —— 现在是要证明这条路走得通，不是要跑分。
+不做"没有人点头时的多轮自主循环" · 不做性能优化 ——
+现在是要证明这条路走得通，不是要跑分。
 
 <br>
 
 ## 目录
 
 ```
-docs/                        CHARTER.md（第一性原理，不可违背）· M1.md · M2.md · M3.md
+docs/                        CHARTER.md（第一性原理，不可违背）· M1.md · M2.md · M3.md · M7.md
 packaging/autonomic-agent/   debian/ + src/
                                autonomic-agentd   身份守护进程（无特权）
                                autonomic-actd     通道的执行半边（有特权、有边界）
                                autonomicact.py    原语目录：dry_run/apply/verify + 可逆性
-                               autonomicctl       status / setup / llm / act / actions
+                               autonomicplan.py   说人话 -> 受校验的动作（模型提议，通道裁决）
+                               autonomicconf.py   配置与凭据（两个文件，刻意分开）
+                               autonomicctl       status / setup / llm / ask / act / actions / backups
 build/                       build.sh · build-rootfs.sh · make-iso.sh · autonomic-install
 scripts/                     install-test.sh（装机全自动验收）· boot-test.sh
+                             test-plan.py（21 项纯逻辑自检，CI 必跑）
+                             mock-llm.py（假模型端点：没有 key 也能验整条 AI 路径）
 ```
 
 <br>
