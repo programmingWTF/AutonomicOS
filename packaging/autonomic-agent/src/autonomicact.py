@@ -47,7 +47,7 @@ import socket
 import subprocess
 import time
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 
 # ------------------------------------------------------------------ 写权限边界
 # 白名单，不是黑名单。
@@ -867,6 +867,150 @@ def act_user_add(params: dict, phase: str) -> dict:
                     evidence)
     return ok("已核实用户 %s（uid=%d，家目录 %s）"
               % (name, ent["uid"], ent["home"]), changed=False, evidence=evidence)
+
+
+# ------------------------------------------------------------------ action: sys.read
+#
+# 为什么感知也要走通道，而不是让 agent 自己去读 /proc：
+#
+#   1. **它读不到。** agent 跑在 ProtectSystem=strict + ProtectProc=invisible
+#      下面，看不见别的进程，也看不见大部分 /proc 和 /sys。想让它"看见"，
+#      要么放宽它的沙箱（那是**加权力**），要么让有权限的一方替它读（这是
+#      **加能力**）。这套设计的全部纪律都在选后者。
+#
+#   2. **看也要留痕。** "agent 什么时候看了什么"和"改了什么"一样是审计的
+#      一部分 —— 一个半夜在遍历 /proc 的进程是值得问一句"它在找什么"的。
+#
+#   3. **必须是白名单化的指标名，不能是"读任意文件"。** 后者等于开了一个
+#      任意文件读取漏洞：/etc/shadow 也是文件。所以下面这张表是**闭集**，
+#      每个名字对应一段我们写死的读法，调用者给不出路径。
+#
+# 只读原语一律 changed=False：它们不改变世界，所以也不推进世界版本号。
+# 一个会把 action_seq 推高的"读取"会让账本失去意义。
+#
+# 平台相关的那几段（statvfs / sched_getaffinity）全部藏在**可替换的小函数**
+# 里，理由和 bug 3 的 `_passwd_lookup` 一模一样：POSIX-only 的调用会让这些
+# 原语在非 Linux 上永远只撞 AttributeError，正常路径一次都跑不到，测试就
+# 只剩下错误分支可测。抽成函数之后，测试可以替掉它们，走完整条路。
+
+# 名字 -> (读法, 参数)
+# 读法要么是 ("file", 路径) 读一个小文件，要么是 ("count_cpu", None) /
+# ("disk_usage", None) 这类我们写死的小逻辑。
+_READ_PROBES = {
+    "os.release": ("file", "/etc/os-release"),
+    "kernel": ("file", "/proc/sys/kernel/osrelease"),
+    "uptime": ("file", "/proc/uptime"),
+    "loadavg": ("file", "/proc/loadavg"),
+    "meminfo": ("file", "/proc/meminfo"),
+    "cpuinfo_count": ("count_cpu", None),
+    "disk_usage": ("disk_usage", None),
+    "hostname": ("file", "/proc/sys/kernel/hostname"),
+    "timezone": ("file", "/etc/timezone"),
+}
+
+
+def _probe_disk_usage() -> str:
+    """根文件系统的使用情况。给 agent 一个'这台机器还喘得过来吗'的抓手。"""
+    statvfs = getattr(os, "statvfs", None)
+    if statvfs is None:
+        # 不是 statvfs 失败，是**这台机器的 Python 根本没有这个调用**。
+        # 两者要说清楚："没有这个指标"和"有指标但我读不动"对操作者是
+        # 两件不同的事，混成一句话会让人去查权限，其实该查的是平台。
+        return "(这台机器的 Python 上没有 statvfs，指标不可得)"
+    try:
+        st = statvfs("/")
+    except OSError as exc:
+        return "(statvfs 失败：%s)" % exc
+    total = st.f_blocks * st.f_frsize
+    free = st.f_bavail * st.f_frsize
+    used = total - free
+    if total <= 0:
+        return "(读到 0 字节的容量，跳过)"
+    return "total=%d used=%d free=%d used_pct=%.1f%%" % (
+        total, used, free, 100.0 * used / total)
+
+
+def _probe_cpu_count() -> str:
+    getaff = getattr(os, "sched_getaffinity", None)
+    if getaff is not None:
+        try:
+            return "online_cpus=%d" % len(getaff(0))
+        except OSError:
+            pass
+    n = 0
+    try:
+        with open("/proc/cpuinfo") as fh:
+            n = sum(1 for ln in fh if ln.startswith("processor"))
+    except OSError:
+        return "(既没有 sched_getaffinity，也读不到 /proc/cpuinfo，指标不可得)"
+    return "online_cpus=%d (from /proc/cpuinfo)" % n
+
+
+@register("sys.read", ("metric",), reversible=True)
+def act_sys_read(params: dict, phase: str) -> dict:
+    """只读地看一眼这台机器的某个指标。
+
+    metric 必须在这张闭集表里 —— 调用者提供的是**指标名**，不是路径。
+    想加新指标就改这张表；改表要过 code review、要写测试，
+    而不是由提示词里的一句话决定。
+    """
+    metric = str(params["metric"]).strip()
+    if metric not in _READ_PROBES:
+        return fail(
+            "未知指标 %r。可读的指标只有这些：%s"
+            % (metric, ", ".join(sorted(_READ_PROBES))),
+            {"metric": metric, "known": sorted(_READ_PROBES)},
+        )
+
+    kind, arg = _READ_PROBES[metric]
+    if kind == "file":
+        text = _read(arg)
+        if text is None:
+            # ⚠️ 这句话刻意说得含糊，是因为**在 actd 里我们分不清**：
+            # agent 侧看是"路径不存在"，但真到了 root 上，多半是
+            # 这台机器（容器/非 Linux）压根没这个文件。硬要二选一
+            # 会给出确定的错答案，所以并列两种情况，让操作者自己核。
+            return fail(
+                "读不到指标 %s（%s）—— 可能这台机器上没有这个文件，"
+                "也可能被沙箱挡住" % (metric, arg),
+                {"metric": metric, "path": arg, "kind": kind})
+        value = text.strip()
+        # os-release 是一堆 KEY=value，压成一行更好放进 journal
+        if metric == "os.release":
+            for ln in value.splitlines():
+                if ln.startswith("PRETTY_NAME="):
+                    value = ln.split("=", 1)[1].strip().strip('"')
+                    break
+    elif kind == "count_cpu":
+        value = _probe_cpu_count()
+    elif kind == "disk_usage":
+        value = _probe_disk_usage()
+    else:  # pragma: no cover - 表是闭集，写错在这里就会炸而不是静默
+        return fail("内部错误：指标 %r 的读法 %r 没实现" % (metric, kind))
+
+    # 只读：三个阶段的回答完全一样，身份保持不变。
+    # 刻意不主张"可逆/不可逆"那套语义 —— 它没改任何东西，所以 reversible
+    # 这个字段对它没有意义（dispatcher 仍会按登记的 True 填，无害）。
+    return ok("%s = %s" % (metric, value), changed=False,
+              evidence={"metric": metric, "value": value})
+
+
+# 服务的状态，只读。为什么单独一个原语而不是让 sys.read 去读 systemctl：
+# 它走的是 systemctl 的机器可读输出，而"解析 systemctl 输出"这件事
+# 应该只有一份实现。
+@register("service.status", ("unit",), reversible=True)
+def act_service_status(params: dict, phase: str) -> dict:
+    unit = str(params["unit"]).strip()
+    if unit.startswith("-") or "/" in unit or ".." in unit:
+        return fail("unit 名不合法：%r" % unit)
+    rc_a, active = _run(["systemctl", "is-active", unit])
+    rc_e, enabled = _run(["systemctl", "is-enabled", unit])
+    rc_s, sub = _run(["systemctl", "show", "-p", "SubState", "--value", unit])
+    value = "active=%s enabled=%s substate=%s" % (
+        active or "unknown", enabled or "unknown", sub or "unknown")
+    return ok("%s: %s" % (unit, value), changed=False,
+              evidence={"unit": unit, "active": active, "enabled": enabled,
+                        "substate": sub})
 
 
 # ------------------------------------------------------------------ action: self.test

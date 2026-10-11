@@ -205,8 +205,118 @@ finally:
 
 # catalogue 必须把这些新原语也报出去 —— 否则 LLM 永远规划不到它们
 names = {c["name"] for c in act.catalogue()}
-for want in ("pkg.install", "pkg.remove", "pkg.list", "user.add"):
+for want in ("pkg.install", "pkg.remove", "pkg.list", "user.add",
+             "sys.read", "service.status"):
     check("catalogue 里有 %s" % want, want in names)
+
+
+# --------------------------------------------------------------------------
+# M9 感知层：sys.read / service.status
+#
+# 只读原语最容易出的两个错，都不是"读错了值"，而是：
+#   ① 把指标名当路径用 —— 那就等于开了任意文件读取漏洞；
+#   ② 只读却被算成"改了世界" —— 那会把世界版本号这个账本搅浑。
+# 下面两条分别钉住它们。值本身不检查（每台机器都不一样），
+# 检查的是**这条路的形状**。
+
+print()
+print("sys.read：白名单是闭集，指标名不是路径")
+
+_r = act.dispatch("sys.read", {"metric": "/etc/shadow"}, "dry_run")
+check("把路径当指标名传 -> 拒绝", _r.get("ok") is False, "got %r" % _r.get("ok"))
+check("拒绝时把合法指标名全列出来（否则模型只能瞎猜）",
+      "os.release" in (_r.get("detail") or ""), "detail=%r" % _r.get("detail"))
+_r = act.dispatch("sys.read", {"metric": "..%s.." % os.sep + "etc/passwd"}, "dry_run")
+check("带路径穿越的指标名 -> 拒绝", _r.get("ok") is False)
+_r = act.dispatch("sys.read", {}, "dry_run")
+check("缺 metric -> 拒绝", _r.get("ok") is False)
+_r = act.dispatch("sys.read", {"metric": ""}, "dry_run")
+check("空 metric -> 拒绝", _r.get("ok") is False)
+_r = act.dispatch("sys.read", {"metric": "OS.RELEASE"}, "dry_run")
+check("指标名大小写敏感（不做猜测性归一化）", _r.get("ok") is False)
+
+print()
+print("sys.read：只读的动作不许推进世界版本号")
+
+for _m in sorted(act._READ_PROBES):
+    _r = act.dispatch("sys.read", {"metric": _m}, "dry_run")
+    check("指标 %s 的 dry_run 是 changed=False" % _m, _r.get("changed") is False,
+          "got %r" % _r.get("changed"))
+
+print()
+print("sys.read 的正常路径（把读文件替换掉，任何系统都能测）")
+
+_orig_read = act._read
+_orig_probe_cpu = act._probe_cpu_count
+_orig_probe_disk = act._probe_disk_usage
+try:
+    act._read = lambda p: "PRETTY_NAME=\"AutonomicOS 9.9 (probe)\"\nID=autonomic\n"
+    _r = act.dispatch("sys.read", {"metric": "os.release"}, "dry_run")
+    check("os.release 正常读到并压成一行 PRETTY_NAME",
+          _r.get("ok") is True and _r["evidence"]["value"] == "AutonomicOS 9.9 (probe)",
+          "got %r" % _r.get("evidence"))
+
+    act._read = lambda p: None
+    _r = act.dispatch("sys.read", {"metric": "kernel"}, "dry_run")
+    check("读不到时是 fail 而不是 ok（不能把'读失败'伪装成成功）",
+          _r.get("ok") is False, "got %r" % _r.get("ok"))
+    check("读不到的措辞同时提到'没有这个文件'和'被沙箱挡住'两种情况",
+          "没有" in (_r.get("detail") or "") and "沙箱" in (_r.get("detail") or ""),
+          "detail=%r" % _r.get("detail"))
+
+    act._read = _orig_read
+    act._probe_cpu_count = lambda: "online_cpus=8"
+    _r = act.dispatch("sys.read", {"metric": "cpuinfo_count"}, "dry_run")
+    check("cpuinfo_count 走探针函数而不是直接调 os",
+          _r.get("ok") is True and "8" in _r["evidence"]["value"],
+          "got %r" % _r.get("evidence"))
+
+    act._probe_disk_usage = lambda: "total=1 used=1 free=0 used_pct=100.0%"
+    _r = act.dispatch("sys.read", {"metric": "disk_usage"}, "dry_run")
+    check("disk_usage 走探针函数（没有 statvfs 的平台也能测）",
+          _r.get("ok") is True and "total=1" in _r["evidence"]["value"],
+          "got %r" % _r.get("evidence"))
+finally:
+    act._read = _orig_read
+    act._probe_cpu_count = _orig_probe_cpu
+    act._probe_disk_usage = _orig_probe_disk
+
+print()
+print("statvfs 不存在的平台：说的是'指标不可得'，不是'权限不足'")
+
+_saved_statvfs = getattr(os, "statvfs", None)
+try:
+    if _saved_statvfs is not None:
+        del os.statvfs
+    _v = act._probe_disk_usage()
+    check("没有 statvfs 时有明确措辞（不把它说成读取失败）",
+          "statvfs" in _v and "不可得" in _v, "got %r" % _v)
+finally:
+    if _saved_statvfs is not None:
+        os.statvfs = _saved_statvfs
+
+print()
+print("service.status：只读，且 unit 名要挡住参数注入")
+
+for _bad in ("--help", "-x", "../../etc/passwd", "a/b"):
+    _r = act.dispatch("service.status", {"unit": _bad}, "dry_run")
+    check("unit=%r -> 拒绝" % _bad, _r.get("ok") is False,
+          "got %r" % _r.get("ok"))
+_r = act.dispatch("service.status", {}, "dry_run")
+check("缺 unit -> 拒绝", _r.get("ok") is False)
+
+_orig_run = act._run
+try:
+    act._run = lambda argv: (0, {"is-active": "active", "is-enabled": "enabled",
+                                 "show": "running"}.get(argv[1], "unknown"))
+    _r = act.dispatch("service.status", {"unit": "sshd"}, "dry_run")
+    check("正常 unit 走通且 changed=False",
+          _r.get("ok") is True and _r.get("changed") is False,
+          "got ok=%r changed=%r" % (_r.get("ok"), _r.get("changed")))
+    check("service.status 的 dry_run 回报'可逆'但语义上什么都没改",
+          _r.get("reversible") is True)
+finally:
+    act._run = _orig_run
 
 print()
 if FAILED:

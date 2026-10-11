@@ -49,6 +49,7 @@
 | **M6** 向导 | ✅ | 装机 TUI（whiptail）：选盘 → 二次手打设备名 → 主机名 → 用户 → LLM（可跳过） |
 | **M7** 闭环 | ✅ | `autonomicctl ask "…"`：说人话进，受校验的动作出；模型提议，通道裁决 |
 | **M8** 原语 | ✅ | 通道从 5 个动作扩到 9 个：`pkg.*`（装包/卸包/查询）、`user.add`（第一个不可逆动作） |
+| **M9** 感知 | ✅ | agent 第一次**看见**系统：`sys.read`（9 个白名单指标）+ `service.status`，`autonomicctl sense` 一次拿全 |
 
 每次 push 由 CI 编两遍比对 sha256 发布；apt 仓库是静态站点，丢任何 HTTPS 托管上都能用。
 
@@ -126,6 +127,8 @@ autonomic-actd     root，但只认九个登记过的原语，读写路径锁在
 | `sysctl.set` | 内核参数（写入 `/etc/sysctl.d/` 且立刻生效） | 是 |
 | `pkg.install` / `pkg.remove` / `pkg.list` | 安装 / 卸载 / 查询软件包 | 是（配置残留归 purge 管） |
 | `user.add` | 新建账户 | **否** —— 见下 |
+| `sys.read` | 读一个白名单指标（内核 / 内存 / 负载 / 磁盘…） | 只读，不改变世界 |
+| `service.status` | 一个服务现在 active / enabled / substate | 只读，不改变世界 |
 | `self.test` | 通道自身的体检 | 是 |
 
 每个 action 必须回答三个问题，而不是给一个承诺：
@@ -204,6 +207,57 @@ $ sudo autonomicctl ask "把通道自检再做一遍"
 - **没有 shell 逃生口。** 缺能力就承认缺，加原语。一旦开了"内置动作不够就用 shell"
   的口子，上面全部退化成装饰。
 
+### 让 agent 看得见：感知也走同一条门
+
+到 M8 结束，agent 是一个**心跳 + 版本号账本** —— 它知道自己的 uid、自己的 cgroup
+限额，但对**这台机器本身**一无所知：不知道跑的是什么内核、还剩多少内存、根分区
+满没满。
+
+问题不是"没想到去读"，是**它读不到**。agentd 跑在 `ProtectSystem=strict` +
+`ProtectProc=invisible` 下面，物理上看不见别的进程，也看不见大部分 `/proc`、`/sys`。
+这是沙箱在正常工作。
+
+于是只有两条路：**放宽沙箱**（那是加权力），或者**让有权限的一方替它读**
+（那是加能力）。这里选后者 —— 所以感知也是一个原语：
+
+```bash
+$ sudo autonomicctl sense
+
+系统快照（每一项都经由 Action 通道，逐条留痕）
+
+  os.release     Debian GNU/Linux 12 (bookworm)
+  kernel         6.1.0-13-amd64
+  hostname       autonomic
+  uptime         3521.42 9803.11
+  loadavg        0.00 0.01 0.05 1/142 8123
+  meminfo        MemTotal: 2048000 kB ...
+  cpuinfo_count  online_cpus=2
+  disk_usage     total=21474836480 used=2684354560 free=18790481920 used_pct=12.5%
+  timezone       Etc/UTC
+  unit.sshd      active=active enabled=enabled
+
+  读到 11 项，取不到 0 项。
+  已投影到 /run/autonomic/sense（0444，只读）
+```
+
+三条规矩，每条都对应一种能被踩到的错：
+
+- **看也要留痕。** "agent 什么时候看了什么"和"改了什么"是同一件事的两面。
+  一个半夜遍历 `/proc` 的进程值得有人问一句"它在找什么"。所以 `sense` 里的
+  每一次读都走 `act.sock → actd → 审计落盘`，和写文件是同一条路。
+- **只读的不推进世界版本号。** `action_seq` 的全部意义是回答"从我上次看这台机器
+  到现在，它变了没有"。如果读取也把它推高，这个答案就永远是"变了" ——
+  账本退化成一个访问计数器。所以只读原语一律 `changed=False`。
+- **指标名是闭集，不是路径。** 这是整个 M9 唯一真正危险的地方：`sys.read` 如果
+  收一个**路径**，它就是一个任意文件读取漏洞（`/etc/shadow` 也是文件）。
+  所以它收的是**指标名**，名字对应一段我们写死的读法，调用者给不出路径。
+  要加新指标就改那张表 —— 改表要过 review、要写测试，**不由提示词里的一句话决定**。
+
+取不到的指标**照样写进快照**，标注 `unavailable` 并附上原因。一份"少了几行"的
+快照看起来像一切正常；一份写着"这几行取不到，因为……"的才是在说实话。而且
+**"这台机器上没有这个文件"和"被沙箱挡住"是两件事** —— 硬要二选一，会给出一个
+确定的错答案。
+
 ### 加原语，不加权力
 
 让 AI 真的能把这台机器变成用户想要的样子，靠的是**加原语**，不是放宽约束。
@@ -233,8 +287,9 @@ Action 通道，agent 下一个 tick 就会 WARN 并纠正回来。这是整套�
 ### 不花一分钱地验证这一切
 
 ```bash
-python3 scripts/test-plan.py          # 21 项：计划解析与校验（纯函数，跑得飞快）
-python3 scripts/test-primitives.py    # 39 项：pkg.* / user.* 的参数守卫
+python3 scripts/test-plan.py          # 24 项：计划解析与校验（纯函数，跑得飞快）
+python3 scripts/test-primitives.py    # 80 项：pkg.* / user.* / sys.read 的参数守卫
+python3 scripts/test-sense.py         # 23 项：感知只走通道、缺口不隐瞒、不推版本号
 python3 scripts/mock-llm.py &         # 一个假的 OpenAI-compatible 端点
 sudo autonomicctl setup --base-url http://127.0.0.1:8099/v1 \
     --api-key mock --model mock-1 --non-interactive
@@ -271,7 +326,9 @@ sudo autonomicctl ask "把通道自检再做一遍"
 
 不重写内核 / init / C 库 / 包管理格式 · 不做自己的桌面环境（GNOME 那套 Debian 已经做好
 而且比我们做得好）· 不给 agent 一个 shell 逃生口 · 不做多 Agent 编排 ·
-不做"没有人点头时的多轮自主循环" · 不做性能优化 ——
+不做"没有人点头时的多轮自主循环" · 不做性能优化 ·
+**不让 agentd 自己定期去读系统**（"agent 自己在看什么"和"人让它看什么"是两回事，
+定期感知要做成显式的订阅，不是偷偷跑）——
 现在是要证明这条路走得通，不是要跑分。
 
 <br>
@@ -279,18 +336,19 @@ sudo autonomicctl ask "把通道自检再做一遍"
 ## 目录
 
 ```
-docs/                        CHARTER.md（第一性原理，不可违背）· M1.md · M2.md · M3.md · M7.md · M8.md
+docs/                        CHARTER.md（第一性原理，不可违背）· M1.md · M2.md · M3.md · M7.md · M8.md · M9.md
 packaging/autonomic-agent/   debian/ + src/
                                autonomic-agentd   身份守护进程（无特权）
                                autonomic-actd     通道的执行半边（有特权、有边界）
                                autonomicact.py    原语目录：dry_run/apply/verify + 可逆性
                                autonomicplan.py   说人话 -> 受校验的动作（模型提议，通道裁决）
                                autonomicconf.py   配置与凭据（两个文件，刻意分开）
-                               autonomicctl       status / setup / llm / ask / act / actions / backups
+                               autonomicctl       status / sense / setup / llm / ask / act / actions / backups
 build/                       build.sh · build-rootfs.sh · make-iso.sh · autonomic-install
 scripts/                     install-test.sh（装机全自动验收）· boot-test.sh
-                             test-plan.py（21 项纯逻辑自检，CI 必跑）
-                             test-primitives.py（39 项原语参数守卫自检，CI 必跑）
+                             test-plan.py（24 项纯逻辑自检，CI 必跑）
+                             test-primitives.py（80 项原语参数守卫自检，CI 必跑）
+                             test-sense.py（23 项感知层自检，CI 必跑）
                              mock-llm.py（假模型端点：没有 key 也能验整条 AI 路径）
 ```
 

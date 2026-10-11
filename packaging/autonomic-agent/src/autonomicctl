@@ -25,6 +25,7 @@ Two things live here:
   autonomicctl ask      "make it do X" -- intent in, audited actions out
   autonomicctl act      run one Action through the channel (preview -> do -> verify)
   autonomicctl actions  list what the channel is willing to do at all
+  autonomicctl sense    take one system snapshot, through the channel
   autonomicctl backups  every file the channel overwrote, and how to put it back
   autonomicctl version
 """
@@ -33,14 +34,25 @@ from __future__ import annotations
 
 import argparse
 import getpass
-import grp
 import json
 import os
-import pwd
 import signal
 import socket
 import subprocess
 import sys
+
+# pwd / grp 只在 POSIX 上有。它们真正的用场只有一个：cmd_status 里读
+# agent 用户的 uid/gid，而那件事本来就只在 Linux 上有意义。
+#
+# 但**导入期**不该因此炸掉：一个连 import 都过不去的工具，在非 Linux 上
+# 连 actions / sense 这些跟平台无关的命令都跑不了，也就等于测不了。
+# 所以这里容忍缺失，把"没有它"推迟到真正要用它的那一个命令里去说。
+try:
+    import grp
+    import pwd
+except ImportError:  # pragma: no cover - 只在非 POSIX 上走到
+    grp = None
+    pwd = None
 
 # autonomicconf 装在 /usr/share/autonomic/，那不在 Python 的默认搜索路径里。
 # 开发期直接从源码目录跑时，用 AUTONOMIC_LIB 指过去即可。
@@ -48,7 +60,7 @@ sys.path.insert(0, os.environ.get("AUTONOMIC_LIB", "/usr/share/autonomic"))
 import autonomicconf  # noqa: E402  (必须在改完 sys.path 之后)
 import autonomicplan  # noqa: E402  (同上：自然语言 -> 受校验的动作)
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 
 # Action 通道的另一半在这里等着。
 ACT_SOCKET = "/run/autonomic/act.sock"
@@ -57,7 +69,19 @@ UNIT = "autonomic-agent.service"
 AGENT_USER = "autonomic"
 STATE_FILE = "/var/lib/autonomic/state.json"
 WORLD_MARKER = "/run/autonomic/world"
+SENSE_MARKER = "/run/autonomic/sense"
 PID_FILE = "/run/autonomic/agent.pid"
+
+# 感知要看哪几样。这不是"能力清单"——能力清单永远来自 actd
+# （见 _catalogue_and_meta）。这里只是"这一版想看什么"，是一份**意图**，
+# 不是一份许可。真正的许可在 actd 的 _READ_PROBES 里，两边对不上时
+# actd 会拒，而这里的循环要知道怎么受着。
+_SENSE_METRICS = (
+    "os.release", "kernel", "hostname", "uptime",
+    "loadavg", "meminfo", "cpuinfo_count", "disk_usage", "timezone",
+)
+# 这一版顺带看一眼的服务。空手而归也算结果 —— 没装这个服务本身是信息。
+_SENSE_UNITS = ("sshd", "systemd-networkd")
 
 
 def _run(cmd: list[str]) -> str:
@@ -127,16 +151,21 @@ def cmd_status(_args: argparse.Namespace) -> int:
     pid = _agent_pid()
 
     # ---- identity: a user the system knows about ----
-    try:
-        pw = pwd.getpwnam(AGENT_USER)
-        identity = "%s (uid=%d gid=%d)" % (pw.pw_name, pw.pw_uid, pw.pw_gid)
+    if pwd is None:
+        # 到这一步才说"这台机器上没有 pwd"，而不是在 import 期就把整个
+        # CLI 打死。身份查询本来就只在 Linux 上有意义。
+        identity = "n/a (this platform has no pwd module)"
+    else:
         try:
-            grp_entry = grp.getgrgid(pw.pw_gid)
-            identity += " group=%s" % grp_entry.gr_name
+            pw = pwd.getpwnam(AGENT_USER)
+            identity = "%s (uid=%d gid=%d)" % (pw.pw_name, pw.pw_uid, pw.pw_gid)
+            try:
+                grp_entry = grp.getgrgid(pw.pw_gid)
+                identity += " group=%s" % grp_entry.gr_name
+            except KeyError:
+                pass
         except KeyError:
-            pass
-    except KeyError:
-        identity = "MISSING (user %s does not exist)" % AGENT_USER
+            identity = "MISSING (user %s does not exist)" % AGENT_USER
 
     print("Autonomic Agent %s" % VERSION)
     print()
@@ -323,8 +352,18 @@ def cmd_setup(args: argparse.Namespace) -> int:
 
 
 def _act_call(action: str, params: dict, phase: str, reason: str = "") -> dict:
+    # AF_UNIX 只在 POSIX 上存在，而这个 CLI 在非 Linux 上仍要能被人跑起来
+    # 做自检。没有它时给出的是**一句可读的话**，不是一个 AttributeError ——
+    # "这台机器上没法跟通道说话"本身就是一个有用的回答。
+    af_unix = getattr(socket, "AF_UNIX", None)
+    if af_unix is None:
+        return {
+            "ok": False,
+            "detail": "这个平台上没有 AF_UNIX 套接字（本机是 %s），"
+                      "Action 通道只存在于 Linux 上" % sys.platform,
+        }
     try:
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock = socket.socket(af_unix, socket.SOCK_STREAM)
         sock.settimeout(60)
         sock.connect(ACT_SOCKET)
     except OSError as exc:
@@ -376,6 +415,106 @@ def cmd_actions(_args: argparse.Namespace) -> int:
     print()
     print("  不在这个清单里的东西，通道不接受 —— 没有 shell 逃生口。")
     return 0
+
+
+def _sense_once(metric: str) -> dict:
+    """向通道要一个指标，并且**只**走通道。
+
+    为什么不让 autonomicctl 自己 open("/proc/loadavg") 就完了 ——
+    因为那样做的每一次"看"都不会留痕。agent 半夜看了什么，和改了
+    什么一样是审计的一部分；绕过通道的读，账本上查不到。
+
+    更重要的是：agentd 跑在 ProtectProc=invisible 下面，它自己读不到
+    这些东西 —— 想让它看，只能让有权限的一方（actd，root）替它读。
+    这是 **加能力**，不是 **加权力**：通道仍然是唯一入口，读法仍然是
+    actd 里那张闭集表，谁也开不出"读任意文件"的口子。
+    """
+    return _act_call("sys.read", {"metric": metric}, "dry_run")
+
+
+def cmd_sense(args: argparse.Namespace) -> int:
+    """取一份系统快照：一次拿全，然后投影成一份只读文本。
+
+    三个刻意的地方：
+
+    1. **要什么指标是写死在这儿的**（_SENSE_METRICS），不是从 actd 问来的
+       "有什么就读什么"。问来什么读什么是**漂浮的目标**：actd 加一个
+       新原语，agentd 的感知内容就跟着变，快照前后不可比。清单写死在
+       这边，两边对不上就是**这条链路有缺口**，应该被看见，不该被吞掉。
+
+    2. **取不到的指标照样写进快照**，标成 unavailable。一份"少了几行"
+       的快照和一份"明确写着这几行取不到"的快照，读起来完全是两回事。
+
+    3. **不推进世界版本号。** 它一个字节都没改，所以也不该让 action_seq
+       动一下。一个会把版本号推高的读取会让账本失去意义。
+    """
+    print("系统快照（每一项都经由 Action 通道，逐条留痕）")
+    print()
+
+    lines: list[str] = []
+    got = 0
+    missing = 0
+    for metric in _SENSE_METRICS:
+        res = _sense_once(metric)
+        if res.get("ok"):
+            value = (res.get("evidence") or {}).get("value", "")
+            got += 1
+            print("  %-14s %s" % (metric, value))
+            lines.append("%s=%s" % (metric, value))
+        else:
+            missing += 1
+            detail = res.get("detail", "")
+            print("  %-14s [取不到] %s" % (metric, detail))
+            # ⚠️ 取不到也照写。空着的那几行本身就是信息 —— 一份"少了几行"
+            # 的快照看起来像一切正常，一份写着 unavailable 的才是在说实话。
+            lines.append("%s=unavailable (%s)" % (metric, detail))
+
+    for unit in _SENSE_UNITS:
+        res = _act_call("service.status", {"unit": unit}, "dry_run")
+        if res.get("ok"):
+            value = (res.get("evidence") or {}).get("active", "unknown")
+            enabled = (res.get("evidence") or {}).get("enabled", "unknown")
+            got += 1
+            print("  unit.%-9s active=%s enabled=%s" % (unit, value, enabled))
+            lines.append("unit.%s=active:%s enabled:%s" % (unit, value, enabled))
+        else:
+            missing += 1
+            print("  unit.%-9s [取不到] %s" % (unit, res.get("detail", "")))
+            lines.append("unit.%s=unavailable (%s)"
+                         % (unit, res.get("detail", "")))
+
+    print()
+    print("  读到 %d 项，取不到 %d 项。" % (got, missing))
+
+    world = _read(WORLD_MARKER).replace("\n", " ")
+    body = (
+        "# 这份快照取自 Action 通道（autonomicctl sense）。\n"
+        "# 它经过审计：每一行都对应一次有记录的 sys.read / service.status。\n"
+        "# 只读原语不推进世界版本号，所以下面的 world 值和取快照前一致。\n"
+        "world=%s\n" % world
+    ) + "\n".join(lines) + "\n"
+
+    try:
+        os.makedirs(os.path.dirname(SENSE_MARKER), exist_ok=True)
+        tmp = SENSE_MARKER + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        os.chmod(tmp, 0o444)
+        os.replace(tmp, SENSE_MARKER)
+        print("  已投影到 %s（0444，只读）" % SENSE_MARKER)
+    except OSError as exc:
+        # 投影写不出来不该让"读到了什么"消失 —— 屏幕上已经打过了。
+        print("  投影写入失败：%s（快照内容仍然有效，只是没落地）" % exc,
+              file=sys.stderr)
+
+    if args.show:
+        print()
+        print(body, end="")
+
+    # 一项都读不到才算失败。部分读到是正常的（容器里就是这样），
+    # 而"部分读到"恰是操作者最需要知道的事实，不该被一个非零返回码
+    # 盖过去 —— 那会让人以为整个感知坏了。
+    return 0 if got else 1
 
 
 def cmd_act(args: argparse.Namespace) -> int:
@@ -751,6 +890,13 @@ def main() -> int:
     sub.add_parser(
         "actions", help="list every Action the channel accepts (there is no shell escape)"
     ).set_defaults(fn=cmd_actions)
+
+    sense = sub.add_parser(
+        "sense", help="take one system snapshot, every read going through the channel"
+    )
+    sense.add_argument("--show", action="store_true",
+                       help="also print the projected snapshot to stdout")
+    sense.set_defaults(fn=cmd_sense)
 
     act = sub.add_parser(
         "act", help="run one Action: always preview first, verify at the end"

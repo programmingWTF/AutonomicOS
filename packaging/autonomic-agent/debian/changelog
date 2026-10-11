@@ -1,3 +1,65 @@
+autonomic-agent (0.5.0-1) unstable; urgency=medium
+
+  * Perception goes through the channel. Until now the agent was a heartbeat
+    and a version ledger: it knew its own uid and cgroup limits, and nothing
+    at all about the machine around it. Not because nobody thought to look --
+    because it cannot: agentd runs under ProtectSystem=strict and
+    ProtectProc=invisible, so /proc and /sys are physically out of reach.
+    There were two ways to fix that: loosen the sandbox (that is adding
+    *power*) or have the privileged side read on its behalf (that is adding
+    *capability*). This release does the second, which makes perception a
+    primitive like any other -- same socket, same audit trail.
+    - sys.read(metric): a closed set of nine metrics -- os.release, kernel,
+      hostname, uptime, loadavg, meminfo, cpuinfo_count, disk_usage,
+      timezone. The caller supplies a *metric name*, never a path. A sys.read
+      that took a path would be an arbitrary-file-read hole (/etc/shadow is
+      also a file), and a channel that can read anything is harder to audit
+      than one that can write a named thing, because writes are fenced by an
+      allowlist and reads quietly become "exfiltrate the machine".
+    - service.status(unit): active / enabled / substate, from systemctl's
+      machine-readable output. Unit names reject '-'-prefixed and path-like
+      values, since systemctl would otherwise treat them as its own options.
+    - Read-only primitives are always changed=False and never bump
+      action_seq. The world version number exists to answer "has this machine
+      changed since I last looked"; a read that moved it would make that
+      answer permanently "yes", and the ledger would degrade into a visit
+      counter.
+    - autonomicctl sense: one snapshot, every read through the channel, then
+      projected read-only to /run/autonomic/sense (0444) together with the
+      world version at the moment of reading. Metrics that cannot be read are
+      still written into the snapshot, marked unavailable with a reason --
+      a snapshot that is quietly missing a few lines looks like everything is
+      fine, while one that says so is telling the truth. The wording keeps
+      "this machine does not have that file" distinct from "the sandbox
+      blocked me": collapsing the two gives a confidently wrong answer.
+    - Why the metric list is hardcoded on the caller's side rather than asked
+      of actd: asking for "whatever you have" is a drifting target -- adding
+      a primitive would silently change what a snapshot contains, and
+      snapshots taken before and after would no longer be comparable. If the
+      two sides disagree, that is a gap in the chain, and it should be seen
+      rather than swallowed.
+
+  * Same lesson as M8's third bug, applied again. pwd is POSIX-only, so
+    user.add could never exercise its happy path off Linux. The new
+    primitives walked straight into it: os.statvfs does not exist on Windows
+    either, and the failure surfaced as an AttributeError rather than a
+    reading. Platform-specific calls are now wrapped in small replaceable
+    functions, and "this platform has no statvfs" is reported differently
+    from "statvfs failed" -- the first tells you to check the platform, the
+    second to check permissions. Same treatment for three more of the same
+    kind: autonomicctl no longer explodes at import time on a platform
+    without grp/pwd; _act_call reports a missing AF_UNIX as a readable
+    sentence instead of an AttributeError; and a failed projection no longer
+    discards what was already read.
+
+  * Self-checks: 137 assertions across four suites. test-sense.py is new and
+    is deliberate about what it does *not* assert -- not the values (they
+    differ per machine), but the shape of the path: every read goes through
+    the channel, gaps are recorded rather than omitted, and nothing read-only
+    ever reaches an apply phase.
+
+ -- LiGuiyu <openclaw@liguiyu.com>  Sat, 11 Oct 2026 22:40:00 +0000
+
 autonomic-agent (0.4.0-1) unstable; urgency=medium
 
   * More primitives, not more power. The channel grows from 5 actions to 9,

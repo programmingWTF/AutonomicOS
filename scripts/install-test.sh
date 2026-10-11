@@ -96,6 +96,26 @@ $SSH 'echo "--- 两个守护进程（思考者 + 执行者）---";
       echo "--- 包名注入守卫 ---";
       autonomicctl act pkg.install packages="nginx; rm -rf /" --yes 2>&1 | sed -n "1,4p"' 2>&1
 
+step "7b. 验收：感知层 —— agent 真的看得见这台机器（M9）"
+# 这一节的要点不是"读出来的值对不对"（值每台机器都不一样），而是三件事：
+#   ① 感知走的是同一条通道（sys.read / service.status 而不是自己 open /proc）
+#   ② 指标名是闭集，给个路径进不去
+#   ③ 只读不推进世界版本号
+$SSH 'echo "--- 一份系统快照：每一项都经由通道 ---";
+      autonomicctl sense --show 2>&1 | sed -n "1,30p";
+      echo;
+      echo "--- 只读不推版本号：取快照前后，action_seq 应该一模一样 ---";
+      autonomicctl world 2>&1 | grep action_seq;
+      autonomicctl sense >/dev/null 2>&1;
+      autonomicctl world 2>&1 | grep action_seq;
+      echo;
+      echo "--- 闭集守卫：把路径当指标名传，必须被拒并列出合法指标名 ---";
+      autonomicctl act sys.read metric=/etc/shadow --yes 2>&1 | sed -n "1,6p";
+      echo;
+      echo "--- 服务状态也走通道，且 unit 名挡住参数注入 ---";
+      autonomicctl act service.status unit=sshd --yes 2>&1 | sed -n "1,6p";
+      autonomicctl act service.status unit="--help" --yes 2>&1 | sed -n "1,4p"' 2>&1
+
 step "8. 验收：AI 闭环 —— 说人话 -> 校验 -> 预演 -> 落地 -> 回滚"
 # 这一节用仓库自带的假 LLM 端点（scripts/mock-llm.py）在**虚机里**跑完整条
 # AI 路径。为什么要用假的：这条链路最贵的东西不是 LLM 的智力，而是

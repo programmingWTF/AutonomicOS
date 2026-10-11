@@ -4,7 +4,7 @@ set -u
 cd /mnt/d/Code/AutonomicOS
 OUT=dist/selftest.log
 : > "$OUT"
-for t in scripts/test-plan.py scripts/test-primitives.py scripts/test-backup-naming.py; do
+for t in scripts/test-plan.py scripts/test-primitives.py scripts/test-sense.py scripts/test-backup-naming.py; do
     echo "======== $t ========" | tee -a "$OUT"
     python3 "$t" packaging/autonomic-agent/src 2>&1 | tee -a "$OUT"
     echo | tee -a "$OUT"

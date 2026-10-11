@@ -37,6 +37,12 @@ jobs:
       - name: Primitives self-check (pkg.* / user.* guards)
         run: python3 scripts/test-primitives.py
 
+      # 感知层（M9）的自检。它钉的不是"读到的值对不对"（每台机器不一样），
+      # 而是三件更安静的事：有没有绕过通道自己读、取不到时有没有悄悄少写
+      # 一行、只读有没有被算成"改了世界"。
+      - name: Sense self-check (channel-only reads, honest gaps)
+        run: python3 scripts/test-sense.py
+
       - name: Reproducibility check -- build twice, must be byte-identical
         run: |
           a=$(sha256sum dist/*.deb | awk '{print $1}')
