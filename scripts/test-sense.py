@@ -208,6 +208,51 @@ check("投影失败确实是写失败（目标是个目录）",
 ctl.SENSE_MARKER = _temp_marker()
 
 print()
+print("调用侧清单与 actd 白名单必须对齐 —— 对不上就是链路有缺口")
+
+# 这两份清单**故意**分开放：actd 那份是"许可"（通道愿意读什么），
+# autonomicctl 那份是"意图"（这一版想看什么）。分开是对的，但分开之后
+# 就有了一个必须被检查的接缝 —— 一旦漂移，sense 会整天报"取不到"，
+# 而那看起来像环境问题，其实是有人只改了一边。
+try:
+    _act_src = os.path.join(ROOT, "packaging", "autonomic-agent", "src")
+    if _act_src not in sys.path:
+        sys.path.insert(0, _act_src)
+    import autonomicact as _act
+
+    _have = set(_act._READ_PROBES)
+    _want = set(ctl._SENSE_METRICS)
+    check("_SENSE_METRICS 里的每一项 actd 都真的能读",
+          _want <= _have, "actd 没有：%r" % sorted(_want - _have))
+    check("actd 能读的没有一项被 sense 漏掉（漏了就是白加了原语）",
+          _have <= _want, "sense 没要：%r" % sorted(_have - _want))
+except ImportError as exc:  # pragma: no cover
+    check("能导入 autonomicact 做对齐检查", False, "%r" % exc)
+
+check("sense 要看的服务都不是空串（无意义的 unit 名会白跑一趟）",
+      all(u.strip() for u in ctl._SENSE_UNITS))
+
+print()
+print("版本号推进有两道独立闸门，感知一道都过不去")
+
+# 闸门一：actd 只在 ok && changed && phase==apply 时才发 SIGUSR1。
+# 只读原语报 changed=False，所以哪怕有人真去 apply 它，也不会推版本号。
+try:
+    with open(os.path.join(ROOT, "packaging", "autonomic-agent", "src",
+                           "autonomic-actd"), encoding="utf-8") as fh:
+        _actd_src = fh.read()
+    check("actd 的推进条件是 ok && changed && phase==apply（三条都要满足）",
+          'phase == "apply" and result.get("ok") and result.get("changed")' in _actd_src,
+          "actd 里的推进条件变了，请重新审视这条断言")
+except OSError as exc:
+    check("能读到 autonomic-actd 源码", False, "%r" % exc)
+
+# 闸门二：sense 自己只发 dry_run（上面已经断言过）。
+# 两条一起看，才是"感知不可能推高版本号"的完整证明。
+check("闸门一（actd 要 apply）与闸门二（sense 只发 dry_run）同时成立",
+      all(c[2] == "dry_run" for c in CALLS))
+
+print()
 if FAILED:
     print("%d 项失败：%s" % (len(FAILED), ", ".join(FAILED)))
     sys.exit(1)

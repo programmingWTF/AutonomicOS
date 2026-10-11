@@ -289,7 +289,7 @@ Action 通道，agent 下一个 tick 就会 WARN 并纠正回来。这是整套�
 ```bash
 python3 scripts/test-plan.py          # 24 项：计划解析与校验（纯函数，跑得飞快）
 python3 scripts/test-primitives.py    # 80 项：pkg.* / user.* / sys.read 的参数守卫
-python3 scripts/test-sense.py         # 23 项：感知只走通道、缺口不隐瞒、不推版本号
+python3 scripts/test-sense.py         # 28 项：感知只走通道、缺口不隐瞒、不推版本号
 python3 scripts/mock-llm.py &         # 一个假的 OpenAI-compatible 端点
 sudo autonomicctl setup --base-url http://127.0.0.1:8099/v1 \
     --api-key mock --model mock-1 --non-interactive
@@ -348,7 +348,7 @@ build/                       build.sh · build-rootfs.sh · make-iso.sh · auton
 scripts/                     install-test.sh（装机全自动验收）· boot-test.sh
                              test-plan.py（24 项纯逻辑自检，CI 必跑）
                              test-primitives.py（80 项原语参数守卫自检，CI 必跑）
-                             test-sense.py（23 项感知层自检，CI 必跑）
+                             test-sense.py（28 项感知层自检，CI 必跑）
                              mock-llm.py（假模型端点：没有 key 也能验整条 AI 路径）
 ```
 
