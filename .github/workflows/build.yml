@@ -43,6 +43,16 @@ jobs:
       - name: Sense self-check (channel-only reads, honest gaps)
         run: python3 scripts/test-sense.py
 
+      # M10：感知喂回模型之后，最容易坏的不是"喂没喂"，而是模型看到的
+      # 快照和磁盘上存的那份不是同一份、感知被写成了指令、上下文没有上限。
+      - name: Ask-context self-check (one snapshot, bounded, not an instruction)
+        run: python3 scripts/test-ask-context.py
+
+      # 备份命名与可还原性（sidecar 不许猜文件名）。它跨两种路径形状，
+      # 所以也是"可写边界在沙箱参照物下也成立"的那道保险。
+      - name: Backup naming self-check
+        run: python3 scripts/test-backup-naming.py packaging/autonomic-agent/src
+
       - name: Reproducibility check -- build twice, must be byte-identical
         run: |
           a=$(sha256sum dist/*.deb | awk '{print $1}')

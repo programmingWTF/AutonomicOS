@@ -16,16 +16,31 @@
 
 set -eu
 
-# ---- 1/3 可复现：时间 ----
-# 2026-10-09T13:30:00Z = debian/changelog 里 0.1.0-1 的日期。
-# 改版本时同步改这里，不要改成 $(date +%s)。
-SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-1791552600}"
-export SOURCE_DATE_EPOCH
-
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/.." && pwd)
 SRC="$ROOT/packaging/autonomic-agent"
 DIST="${DIST:-$ROOT/dist}"
+
+# ---- 1/3 可复现：时间 ----
+# SOURCE_DATE_EPOCH 钉在"当前版本 changelog 条目的日期"上。
+# 改版本时同步改这里，不要改成 $(date +%s) —— 那会让同棵树两次编出两个包。
+#   0.6.0-1 -> 2026-10-12T14:00:00Z = 1791813600
+#   0.5.0-1 -> 2026-10-11T22:40:00Z = 1791758400
+#   0.1.0-1 -> 2026-10-09T13:30:00Z = 1791552600
+# 想临时覆盖（比如重编历史版本）就设 SOURCE_DATE_EPOCH_OVERRIDE。
+# ⚠️ 别在别处再抄一份这个映射 —— 两处维护迟早对不上，而"对不上"的表现是
+# 构建莫名不可复现，排查起来像灵异事件。这三个数是 `date -u -d '<ISO>' +%s`
+# 算出来的，**别手算**（手算错过一次：把 2026 当成 2025，差整整一年）。
+TOP_VERSION=$(grep -m1 '^autonomic-agent (' "$SRC/debian/changelog" \
+              | sed 's/.*(\([0-9.]*\)-.*/\1/')
+case "$TOP_VERSION" in
+    0.6.0) EPOCH=1791813600 ;;
+    0.5.0) EPOCH=1791758400 ;;
+    *)     EPOCH=1791552600 ;;
+esac
+SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH_OVERRIDE:-$EPOCH}"
+export SOURCE_DATE_EPOCH
+echo "build.sh: SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH (changelog top = $TOP_VERSION)"
 
 # ---- 依赖自检（缺什么说什么，别让 dpkg-buildpackage 报天书）----
 missing=""

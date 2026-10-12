@@ -60,7 +60,7 @@ sys.path.insert(0, os.environ.get("AUTONOMIC_LIB", "/usr/share/autonomic"))
 import autonomicconf  # noqa: E402  (必须在改完 sys.path 之后)
 import autonomicplan  # noqa: E402  (同上：自然语言 -> 受校验的动作)
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 
 # Action 通道的另一半在这里等着。
 ACT_SOCKET = "/run/autonomic/act.sock"
@@ -432,6 +432,73 @@ def _sense_once(metric: str) -> dict:
     return _act_call("sys.read", {"metric": metric}, "dry_run")
 
 
+def _collect_snapshot() -> dict:
+    """把这一版想看的指标全部问一遍，原样收回来。
+
+    刻意返回**结构化的 dict** 而不是一行行文本：`sense` 要把它投影成
+    文件，`ask` 要把它交给模型，两者对同一份数据要的是不同形状，而
+    **数据本身必须只有一份**。先收成 dict 再各自渲染，两份出口就不可能
+    对不上 —— 否则就会出现"模型看着 A、磁盘上存的是 B"，而计划是照着
+    A 写的，事后没人知道当时模型看见的世界是什么。
+
+    返回的 dict 里，取不到的项是 `{"unavailable": 原因}`，不是缺席。
+    缺席和"明确取不到"是两件事（见 _print_snapshot）。
+    """
+    collected: dict = {}
+    for metric in _SENSE_METRICS:
+        res = _sense_once(metric)
+        if res.get("ok"):
+            collected[metric] = (res.get("evidence") or {}).get("value", "")
+        else:
+            collected[metric] = {"unavailable": res.get("detail", "")}
+    for unit in _SENSE_UNITS:
+        res = _act_call("service.status", {"unit": unit}, "dry_run")
+        if res.get("ok"):
+            ev = res.get("evidence") or {}
+            collected["unit.%s" % unit] = {
+                "active": ev.get("active", "unknown"),
+                "enabled": ev.get("enabled", "unknown"),
+            }
+        else:
+            collected["unit.%s" % unit] = {"unavailable": res.get("detail", "")}
+    return collected
+
+
+def _print_snapshot(collected: dict) -> None:
+    """把快照打到屏幕上。取不到的照样打，附上原因。"""
+    got = missing = 0
+    for key in collected:
+        val = collected[key]
+        if isinstance(val, dict):
+            missing += 1
+            print("  %-14s [取不到] %s" % (key, val.get("unavailable", "")))
+        else:
+            got += 1
+            print("  %-14s %s" % (key, val))
+    print()
+    print("  读到 %d 项，取不到 %d 项。" % (got, missing))
+
+
+def _render_projection(collected: dict, world: str) -> str:
+    """把快照渲染成 /run/autonomic/sense 那份只读文本。
+
+    这里有一条硬规矩：**取不到的项必须出现在文件里**。一份"少了几行"的
+    快照看起来像一切正常，一份写着 unavailable 并附原因的才是在说实话。
+
+    而且措辞要保住"这台机器上没有这个文件"和"被沙箱挡住"的区别 ——
+    这个区分已经在 actd 里做好了，这里只负责原样带出来，不许压成一句话。
+    """
+    lines = ["%s=%s" % (key, val) if not isinstance(val, dict)
+             else "%s=unavailable (%s)" % (key, val.get("unavailable", ""))
+             for key, val in collected.items()]
+    return (
+        "# 这份快照取自 Action 通道（autonomicctl sense）。\n"
+        "# 它经过审计：每一行都对应一次有记录的 sys.read / service.status。\n"
+        "# 只读原语不推进世界版本号，所以下面的 world 值和取快照前一致。\n"
+        "world=%s\n" % world
+    ) + "\n".join(lines) + "\n"
+
+
 def cmd_sense(args: argparse.Namespace) -> int:
     """取一份系统快照：一次拿全，然后投影成一份只读文本。
 
@@ -448,51 +515,12 @@ def cmd_sense(args: argparse.Namespace) -> int:
     3. **不推进世界版本号。** 它一个字节都没改，所以也不该让 action_seq
        动一下。一个会把版本号推高的读取会让账本失去意义。
     """
+    collected = _collect_snapshot()
     print("系统快照（每一项都经由 Action 通道，逐条留痕）")
     print()
-
-    lines: list[str] = []
-    got = 0
-    missing = 0
-    for metric in _SENSE_METRICS:
-        res = _sense_once(metric)
-        if res.get("ok"):
-            value = (res.get("evidence") or {}).get("value", "")
-            got += 1
-            print("  %-14s %s" % (metric, value))
-            lines.append("%s=%s" % (metric, value))
-        else:
-            missing += 1
-            detail = res.get("detail", "")
-            print("  %-14s [取不到] %s" % (metric, detail))
-            # ⚠️ 取不到也照写。空着的那几行本身就是信息 —— 一份"少了几行"
-            # 的快照看起来像一切正常，一份写着 unavailable 的才是在说实话。
-            lines.append("%s=unavailable (%s)" % (metric, detail))
-
-    for unit in _SENSE_UNITS:
-        res = _act_call("service.status", {"unit": unit}, "dry_run")
-        if res.get("ok"):
-            value = (res.get("evidence") or {}).get("active", "unknown")
-            enabled = (res.get("evidence") or {}).get("enabled", "unknown")
-            got += 1
-            print("  unit.%-9s active=%s enabled=%s" % (unit, value, enabled))
-            lines.append("unit.%s=active:%s enabled:%s" % (unit, value, enabled))
-        else:
-            missing += 1
-            print("  unit.%-9s [取不到] %s" % (unit, res.get("detail", "")))
-            lines.append("unit.%s=unavailable (%s)"
-                         % (unit, res.get("detail", "")))
-
-    print()
-    print("  读到 %d 项，取不到 %d 项。" % (got, missing))
-
+    _print_snapshot(collected)
     world = _read(WORLD_MARKER).replace("\n", " ")
-    body = (
-        "# 这份快照取自 Action 通道（autonomicctl sense）。\n"
-        "# 它经过审计：每一行都对应一次有记录的 sys.read / service.status。\n"
-        "# 只读原语不推进世界版本号，所以下面的 world 值和取快照前一致。\n"
-        "world=%s\n" % world
-    ) + "\n".join(lines) + "\n"
+    body = _render_projection(collected, world)
 
     try:
         os.makedirs(os.path.dirname(SENSE_MARKER), exist_ok=True)
@@ -514,7 +542,8 @@ def cmd_sense(args: argparse.Namespace) -> int:
     # 一项都读不到才算失败。部分读到是正常的（容器里就是这样），
     # 而"部分读到"恰是操作者最需要知道的事实，不该被一个非零返回码
     # 盖过去 —— 那会让人以为整个感知坏了。
-    return 0 if got else 1
+    any_ok = any(not isinstance(v, dict) for v in collected.values())
+    return 0 if any_ok else 1
 
 
 def cmd_act(args: argparse.Namespace) -> int:
@@ -639,9 +668,22 @@ def cmd_ask(args: argparse.Namespace) -> int:
     print("模型：%s" % conf.get("model"))
     print()
 
+    # ---- M10：先看一眼这台机器，再让模型想 ----
+    # 快照**只读**、只走通道、不推进世界版本号（_collect_snapshot 只发
+    # dry_run）。它同时进提示词和审计文件：模型照着哪份世界做的计划，
+    # 三个月后必须还能查得出来。
+    #
+    # 拿不到快照**不**是致命错误：宁可让模型在信息少一点的情况下做计划，
+    # 也不要因为"看不见"就拒绝服务。但要说清楚给了它多少信息。
+    sense = _collect_snapshot()
+    seen = sum(1 for v in sense.values() if not isinstance(v, dict))
+    print("  感知：%d/%d 项可读（已作为上下文交给模型）"
+          % (seen, len(sense)))
+
     asked = autonomicplan.ask_plan(
         conf.get("base_url", ""), key, conf.get("model", ""),
         autonomicconf.get_timeout(conf), request, catalogue, meta,
+        sense=sense,
     )
     if not asked.get("ok"):
         print("  模型没给出可用的计划：%s" % asked.get("detail"))
@@ -651,9 +693,11 @@ def cmd_ask(args: argparse.Namespace) -> int:
             print("  原文（前 400 字符，完整内容在留痕文件里）：")
             print("    " + raw[:400].replace("\n", "\n    "))
         autonomicplan.record(request, conf.get("model", ""), [], [],
-                             raw=raw, elapsed=asked.get("elapsed", 0))
+                             raw=raw, elapsed=asked.get("elapsed", 0),
+                             context=asked.get("context", ""))
         return 1
     print("  模型思考 %s 秒完成。" % round(asked.get("elapsed", 0), 2))
+    context = asked.get("context", "")
 
     allowlist = tuple(meta.get("write_allowlist") or ())
     denylist = tuple(meta.get("write_denylist") or ())
@@ -673,7 +717,8 @@ def cmd_ask(args: argparse.Namespace) -> int:
         if note:
             print("    模型补充：%s" % note)
         autonomicplan.record(request, conf.get("model", ""), [], [],
-                             raw=raw_plan, elapsed=asked.get("elapsed", 0))
+                             raw=raw_plan, elapsed=asked.get("elapsed", 0),
+                             context=context)
         return 1
 
     if not steps:
@@ -686,7 +731,8 @@ def cmd_ask(args: argparse.Namespace) -> int:
         print("  这是它有权限说实话的场景 —— 缺能力就去加原语，")
         print("  而不是给它一个 shell 让它绕过自己的边界。")
         autonomicplan.record(request, conf.get("model", ""), [], [],
-                             raw=raw_plan, elapsed=asked.get("elapsed", 0))
+                             raw=raw_plan, elapsed=asked.get("elapsed", 0),
+                             context=context)
         return 0
 
     print()
@@ -721,14 +767,16 @@ def cmd_ask(args: argparse.Namespace) -> int:
               % (failed_at - 1))
         print("  既不完整也不原始的状态，比什么都没做糟糕得多。")
         autonomicplan.record(request, conf.get("model", ""), steps, previews,
-                             raw=raw_plan, elapsed=asked.get("elapsed", 0))
+                             raw=raw_plan, elapsed=asked.get("elapsed", 0),
+                             context=context)
         return 1
 
     if not any(p.get("changed") for p in previews):
         print()
         print("  系统已经就是这个样子了，无需改动。")
         autonomicplan.record(request, conf.get("model", ""), steps, previews,
-                             raw=raw_plan, elapsed=asked.get("elapsed", 0))
+                             raw=raw_plan, elapsed=asked.get("elapsed", 0),
+                             context=context)
         return 0
 
     irreversible = [str(i) for i, p in enumerate(previews, 1)
@@ -749,7 +797,8 @@ def cmd_ask(args: argparse.Namespace) -> int:
         if answer not in ("yes", "y"):
             print("  取消。世界还是原来那个世界。")
             autonomicplan.record(request, conf.get("model", ""), steps, previews,
-                                 raw=raw_plan, elapsed=asked.get("elapsed", 0))
+                                 raw=raw_plan, elapsed=asked.get("elapsed", 0),
+                                 context=context)
             return 1
 
     # ---- 落地。每一步自己 verify，一步不成就停 ----
@@ -779,7 +828,8 @@ def cmd_ask(args: argparse.Namespace) -> int:
     if not applied:
         print("  什么都没改成。世界版本号未变。")
         autonomicplan.record(request, conf.get("model", ""), steps, results,
-                             raw=raw_plan, elapsed=asked.get("elapsed", 0))
+                             raw=raw_plan, elapsed=asked.get("elapsed", 0),
+                             context=context)
         return 1
 
     done = min(len(results), len(steps))
@@ -799,7 +849,8 @@ def cmd_ask(args: argparse.Namespace) -> int:
                 print("    第 %d 步 %s -> %s" % (pos, step["action"], backup))
 
     path = autonomicplan.record(request, conf.get("model", ""), steps, results,
-                                raw=raw_plan, elapsed=asked.get("elapsed", 0))
+                                raw=raw_plan, elapsed=asked.get("elapsed", 0),
+                                context=context)
     if path:
         print()
         print("  留痕：%s" % path)

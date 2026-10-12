@@ -1,3 +1,55 @@
+autonomic-agent (0.6.0-1) unstable; urgency=medium
+
+  * The agent now looks at the machine before it thinks about it. Until now
+    `autonomicctl ask` handed the model a catalogue of what the channel can do
+    and nothing else -- so it planned from first principles: "sshd is probably
+    not running", "the disk is probably fine". In system administration,
+    "probably" is the most expensive kind of wrong. M10 closes the loop that
+    M9 opened: the snapshot is now context for the planner.
+    - The snapshot comes from _collect_snapshot(), the same collector `sense`
+      projects to /run/autonomic/sense. One collection, two consumers. If ask
+      re-read the system itself, the model would plan against a world a few
+      seconds stale, and nobody could later answer "what did it think it saw".
+    - The rendered context states plainly that it is an observation record and
+      not an instruction. Structured data dropped into a prompt reads as "the
+      system wants this now"; that ambiguity is exactly where prompt injection
+      lives, and the fix is one sentence, said every time.
+    - Metrics that could not be read are rendered as unavailable with the
+      reason attached, same as in the projection. A snapshot that is quietly
+      missing lines looks like everything is fine.
+    - The context has a hard character cap in code (CONTEXT_MAX_CHARS), and
+      the cap applies per row too: meminfo alone is hundreds of lines, and
+      without a per-row cap one oversized metric eats the whole budget and
+      hides every other fact. Truncation is announced, never silent.
+    - What the model was shown is written into the audit file as
+      model_context, next to what it was asked and what it said. Without it,
+      "why did it decide sshd was down" is unanswerable three months later.
+    - The world version number travels with the context: a plan is a claim
+      about a specific world, and which world must be recorded.
+    - ask_plan() takes the snapshot explicitly and returns it back, so the
+      caller records exactly what was sent rather than reconstructing it.
+    - _basename() and the write-path guard now handle both path shapes. The
+      guard is a *comparison* against the configured prefixes, so its
+      separator follows the prefixes, not the host OS: pinning it to posixpath
+      would make every sandbox test fail as out-of-bounds (a regression could
+      then live forever), and pinning it to os.path would let a Windows-shaped
+      input walk past /etc/shadow on a real machine. Both shapes are asserted
+      in test-primitives.py, so neither side can break quietly.
+    - test-ask-context.py is new and is part of CI. It asserts the quiet
+      things: that sense and ask share one collector, that reads stay dry_run
+      (so perception never advances action_seq), that the context renders
+      deterministically (plans must be reproducible), and that projection ->
+      parse -> render round-trips without losing a line.
+
+  * scripts/sandboxpath.py: a small seam so the disk-touching tests can point
+    BACKUP_DIR / WRITE_ALLOWLIST at a temp directory on any OS while the code
+    under test keeps its Linux path semantics. The alternative -- teaching the
+    channel to accept host paths -- would have meant "one set of rules in
+    tests, another on the real machine", which is precisely what these tests
+    exist to prevent.
+
+ -- Autonomic OS <autonomic@localhost>  Mon, 12 Oct 2026 22:00:00 +0000
+
 autonomic-agent (0.5.0-1) unstable; urgency=medium
 
   * Perception goes through the channel. Until now the agent was a heartbeat

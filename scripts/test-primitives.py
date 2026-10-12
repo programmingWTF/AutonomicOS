@@ -220,6 +220,60 @@ for want in ("pkg.install", "pkg.remove", "pkg.list", "user.add",
 # 检查的是**这条路的形状**。
 
 print()
+print("_check_write_path：可写边界在两种路径形状下都要一字不让")
+
+# 这道检查是**比较**，分隔符跟着配置里的前缀走，不跟着本机 OS 走。
+# 这么设计的理由值得写下来：写死 posixpath 会让 Windows 上的沙箱测试永远
+# 判成越界（于是一个回归能悄悄活过来），写死 os.path 则会让真机上一个
+# `\etc\..` 形状的输入绕过 `/etc/shadow` 这类保护项 —— 后者是安全问题。
+# 所以两边都要测：真机形状保证安全，沙箱形状保证可测。
+_saved_allow, _saved_deny = act.WRITE_ALLOWLIST, act.WRITE_DENYLIST
+try:
+    act.WRITE_ALLOWLIST = ("/etc/autonomic/", "/etc/sysctl.d/", "/run/autonomic/")
+    act.WRITE_DENYLIST = ("/etc/shadow", "/etc/passwd", "/etc/sudoers",
+                          "/etc/ssh/")
+    for _bad in ("/etc/shadow", "/etc/passwd", "/etc/sudoers",
+                 "/etc/ssh/sshd_config", "/etc/ssh/../../etc/shadow",
+                 "/root/.ssh/authorized_keys", "/etc/cron.d/evil", "/", "/etc",
+                 "/etc/autonomic/../../etc/shadow"):
+        _ok, _why = act._check_write_path(_bad)
+        check("Linux 形状：拒绝 %r" % _bad, _ok is False, _why)
+    for _good in ("/etc/autonomic/x.conf", "/etc/autonomic/a/b/c",
+                  "/etc/sysctl.d/99-autonomic.conf", "/run/autonomic/world"):
+        _ok, _why = act._check_write_path(_good)
+        check("Linux 形状：允许 %r" % _good, _ok is True, _why)
+    _ok, _why = act._check_write_path("etc/autonomic/x")
+    check("Linux 形状：相对路径被拒", _ok is False, _why)
+
+    # 沙箱形状：Windows 上跑测试时，前缀表和路径都是本机形态。
+    # 这一组不是"兼容 Windows 的补丁"，是钉住"同一道边界在两种参照物下
+    # 都成立"—— 否则改坏了只有真机那一侧会报警，而那一侧恰恰最难跑。
+    act.WRITE_ALLOWLIST = ("C:\\sb\\etc\\autonomic\\",)
+    act.WRITE_DENYLIST = ("C:\\sb\\etc\\shadow",)
+    for _bad in ("C:\\sb\\etc\\shadow", "C:\\sb\\etc\\..\\..\\Windows\\x",
+                 "C:\\sb\\etc\\autonomic\\..\\..\\etc\\shadow",
+                 "/etc/autonomic/x"):
+        _ok, _why = act._check_write_path(_bad)
+        check("沙箱形状：拒绝 %r" % _bad, _ok is False, _why)
+    _ok, _why = act._check_write_path("C:\\sb\\etc\\autonomic\\x.conf")
+    check("沙箱形状：允许合法路径", _ok is True, _why)
+finally:
+    act.WRITE_ALLOWLIST, act.WRITE_DENYLIST = _saved_allow, _saved_deny
+
+print()
+print("_basename：备份名只保留文件名一段，两种分隔符都认")
+
+for _p, _want in (("/etc/autonomic/demo.conf", "demo.conf"),
+                  ("/etc/autonomic/", "autonomic"),
+                  ("/demo.conf", "demo.conf"),
+                  ("/", "root"),
+                  ("C:\\sb\\etc\\demo.conf", "demo.conf")):
+    _got = act._basename(_p)
+    check("_basename(%r) = %r" % (_p, _want), _got == _want, "got %r" % _got)
+check("备份名里不出现冒号或反斜杠（Windows 上不是合法文件名）",
+      not any(c in act._basename("C:\\sb\\etc\\demo.conf") for c in ":\\"))
+
+print()
 print("sys.read：白名单是闭集，指标名不是路径")
 
 _r = act.dispatch("sys.read", {"metric": "/etc/shadow"}, "dry_run")

@@ -47,7 +47,7 @@ import socket
 import subprocess
 import time
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 
 # ------------------------------------------------------------------ 写权限边界
 # 白名单，不是黑名单。
@@ -201,15 +201,48 @@ def catalogue() -> list:
 
 
 def _check_write_path(path: str) -> tuple[bool, str]:
-    if not path.startswith("/"):
+    """这个路径允许被写吗。返回 (允许吗, 归一化后的路径或拒绝理由)。
+
+    ⚠️ 这里判断的是**比较**，不是"这个路径在磁盘上是什么"。
+    所以分隔符跟着**配置里的前缀**走，而不是跟着本机 OS 走：
+
+      * 前缀写成 `/etc/autonomic/`（真机上就是这样）→ 用 `/` 比；
+      * 前缀写成 `C:\\sandbox\\etc\\autonomic\\`（测试沙箱）→ 用 `\\` 比。
+
+    判据是"能不能匹配上前缀表"，所以形状必须和前缀表一致。写死 posixpath
+    会让 Windows 上的沙箱测试永远判成越界；写死 os.path 则会让真机上一个
+    `\\etc\\...` 形状的输入绕过 `\\etc\\shadow` 这类保护项 —— 后者是安全问题。
+
+    真正"这个文件在磁盘上存不存在"由 `_exists` / `_read` 回答，那边用的
+    是本机语义。**判允许 和 碰磁盘 是两件事，分开写才不会互相污染。**
+    """
+    sep = os.sep if (WRITE_ALLOWLIST and os.sep in WRITE_ALLOWLIST[0]) else "/"
+
+    def _norm(p: str) -> str:
+        # 只归一化"配置用的那种分隔符"，另一种原样留着 —— 这样
+        # `/etc/../etc/shadow` 仍会被抓出来，而 `\\etc\\..` 不会被误判。
+        p = p.strip()
+        while sep * 2 in p:
+            p = p.replace(sep * 2, sep)
+        parts: list[str] = []
+        for part in p.split(sep):
+            if part in ("", "."):
+                continue
+            if part == "..":
+                if parts:
+                    parts.pop()
+                continue
+            parts.append(part)
+        return (sep + sep.join(parts)) if p.startswith(sep) else (sep.join(parts))
+
+    real = _norm(path)
+    if not path.startswith(("/", "\\")) and not (len(path) > 1 and path[1] == ":"):
         return False, "路径必须是绝对路径：%r" % path
-    # posixpath，不是 os.path：这里判断的是目标系统里的路径语义。
-    real = posixpath.normpath(path)
     for bad in WRITE_DENYLIST:
-        if real == bad or real.startswith(bad):
+        if real == _norm(bad) or real.startswith(_norm(bad)):
             return False, "拒绝：%s 在系统保护名单上" % real
     for prefix in WRITE_ALLOWLIST:
-        if real.startswith(prefix):
+        if real.startswith(_norm(prefix)):
             return True, real
     return False, (
         "拒绝：%s 不在可写目录里。允许的前缀：%s"
@@ -229,6 +262,22 @@ def _read(path: str) -> str | None:
         return None
 
 
+def _basename(path: str) -> str:
+    """取路径的最后一段，**两种分隔符都认**。
+
+    这里刻意用 os.path.basename 而不是 posixpath.basename：喂给这个函数的
+    路径是**要在本机磁盘上存在的那个文件**，所以它的分隔符跟着本机走。
+    在 Linux 上两者逐字节相同；在 Windows 上 posixpath.basename 会把
+    `C:/dir/demo.conf` 整个当成一个文件名 —— 于是备份名里带着冒号和反斜杠，
+    既不是合法文件名，也丢了"它在哪个目录下"这个信息。
+
+    这和 `_check_write_path` 里刻意用 posixpath 不矛盾：那边判断的是
+    **目标系统的路径语义**（一个安全边界），这边取的是**本机文件名**。
+    两件事分开，才不会为了跑测试把安全边界改成 os.path。
+    """
+    return os.path.basename(path.replace("\\", "/").rstrip("/")) or "root"
+
+
 def _backup(path: str) -> str:
     """apply 之前把原文件存一份。回滚的凭据就指着它。
 
@@ -242,9 +291,9 @@ def _backup(path: str) -> str:
     一样：同一秒内的两次备份还是撞在一起。这个坑已经踩过一次了。
 
     除了内容副本，还写一个同名 .json 的 sidecar 记录它**原本属于哪里**。
-    这不是冗余：备份名里的路径分隔符是 `_`，而 Linux 路径本身允许 `_`，
-    所以 `/etc/autonomic/my_conf` 编码成 `etc_autonomic_my_conf` 之后，
-    谁也分不清那是三个目录还是两个目录加一个下划线。
+    这不是冗余：备份名只保留文件名一段，而 Linux 路径本身允许 `_`，
+    所以 `etc_autonomic_my_conf` 到底是 `/etc/autonomic/my_conf` 还是
+    `/etc/autonomic_my/conf`，光看名字分不出来。
     **猜一个文件从哪来，正是"回滚"变成"覆盖"的方式。**
     机器要还原，就必须读 sidecar；没有 sidecar 就拒绝还原。
     """
@@ -257,9 +306,7 @@ def _backup(path: str) -> str:
     if micros >= 1_000_000:
         micros = 999_999
     stamp = "%s%06d" % (time.strftime("%Y%m%dT%H%M%S", time.localtime(now)), micros)
-    target = os.path.join(
-        BACKUP_DIR, "%s_%s" % (stamp, path.strip("/").replace("/", "_"))
-    )
+    target = os.path.join(BACKUP_DIR, "%s_%s" % (stamp, _basename(path)))
     shutil.copy2(path, target)
     try:
         meta = {
@@ -366,9 +413,15 @@ def act_file_restore(params: dict, phase: str) -> dict:
 
     # 两端都要卡死：源必须在备份目录里，目标必须在可写前缀里。
     # 只卡一头的话，攻击者可以把"备份"指向任意文件再让它还原到别处。
-    if not backup.startswith(BACKUP_DIR.rstrip("/") + "/"):
+    #
+    # 分隔符取 os.sep 而不是写死 "/"：BACKUP_DIR 是一个**磁盘位置**
+    # （copy / open / isfile 都直接用它），它的分隔符跟着本机走。写死 "/"
+    # 在 Linux 上完全正确，在 Windows 上会把一个合法的备份路径判成越界 ——
+    # 而这是安全边界：判错了要么放过一个越界路径，要么把合法还原整个拒掉。
+    prefix = BACKUP_DIR.rstrip("/").rstrip(os.sep) + os.sep
+    if not backup.startswith(prefix):
         return fail(
-            "拒绝：备份文件必须在 %s/ 之下（拿到的是 %r）" % (BACKUP_DIR, raw_backup),
+            "拒绝：备份文件必须在 %s 之下（拿到的是 %r）" % (BACKUP_DIR, raw_backup),
             {"backup": raw_backup},
         )
     if not os.path.isfile(backup):
