@@ -336,7 +336,8 @@ sudo autonomicctl ask "把通道自检再做一遍"
 ## 目录
 
 ```
-docs/                        CHARTER.md（第一性原理，不可违背）· M1.md · M2.md · M3.md · M7.md · M8.md · M9.md
+docs/                        CHARTER.md（第一性原理，不可违背）· M1.md ~ M9.md（各里程碑设计）
+                             HANDOFF.md（给下一个 Agent 的交接提示词）
 packaging/autonomic-agent/   debian/ + src/
                                autonomic-agentd   身份守护进程（无特权）
                                autonomic-actd     通道的执行半边（有特权、有边界）
